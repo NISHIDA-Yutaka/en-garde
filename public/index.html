@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>アンギャルド 対戦</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ===================== ロビー ===================== -->
+    <section id="lobby" class="screen lobby">
+      <div class="lobby-card">
+        <h1 class="title">
+          <span class="title-fr">En Garde</span>
+          <span class="title-jp">アンギャルド 対戦</span>
+        </h1>
+        <p class="tagline">剣士よ、間合いを制せ。2人用カードデュエル。</p>
+
+        <label class="field">
+          <span class="field-label">名前</span>
+          <input id="name-input" type="text" maxlength="16" placeholder="プレイヤー" autocomplete="nickname" />
+        </label>
+
+        <button id="create-btn" class="btn btn-primary btn-block">部屋を作る</button>
+
+        <div class="divider"><span>または</span></div>
+
+        <label class="field">
+          <span class="field-label">部屋コード</span>
+          <input id="room-input" type="text" maxlength="5" placeholder="XXXXX" autocapitalize="characters" autocomplete="off" />
+        </label>
+        <button id="join-btn" class="btn btn-secondary btn-block">参加する</button>
+
+        <p id="lobby-error" class="error-text" hidden></p>
+        <button id="rules-btn-lobby" class="btn btn-ghost btn-block">遊び方（?）</button>
+      </div>
+    </section>
+
+    <!-- ===================== 待機 ===================== -->
+    <section id="waiting" class="screen waiting hidden">
+      <div class="lobby-card">
+        <h2 class="waiting-title">相手を待っています…</h2>
+        <div class="spinner" aria-hidden="true"></div>
+        <p class="waiting-room">部屋コード <strong id="waiting-code">-----</strong></p>
+        <label class="field">
+          <span class="field-label">招待URL</span>
+          <input id="invite-url" type="text" readonly />
+        </label>
+        <button id="copy-btn" class="btn btn-primary btn-block">URLをコピー</button>
+        <p id="copy-done" class="ok-text" hidden>コピーしました</p>
+        <p class="waiting-hint">相手が同じURLを開くと対戦が始まります。</p>
+      </div>
+    </section>
+
+    <!-- ===================== 対戦 ===================== -->
+    <section id="game" class="screen game hidden">
+      <header class="topbar">
+        <div class="score-board">
+          <div class="player-tag p0" id="tag0">
+            <span class="dot"></span>
+            <span class="pname" id="name0">プレイヤー1</span>
+            <span class="pscore" id="score0">0</span><span class="pgoal">/5</span>
+          </div>
+          <div class="vs">VS</div>
+          <div class="player-tag p1" id="tag1">
+            <span class="pscore" id="score1">0</span><span class="pgoal">/5</span>
+            <span class="pname" id="name1">プレイヤー2</span>
+            <span class="dot"></span>
+          </div>
+        </div>
+        <div class="topbar-info">
+          <span class="chip" id="round-chip">第1ラウンド</span>
+          <span class="chip" id="distance-chip">間合い 22</span>
+          <span class="chip" id="deck-chip">山札 15</span>
+          <span class="chip" id="discard-chip">捨て札 –</span>
+          <button id="rules-btn" class="icon-btn" title="遊び方">?</button>
+        </div>
+      </header>
+
+      <div class="presence-banner hidden" id="presence-banner">相手の接続が切れました（再接続を待っています）</div>
+
+      <div class="table">
+        <div class="side opponent-side">
+          <div class="side-label"><span id="opp-label">相手の手札</span></div>
+          <div class="opp-hand" id="opp-hand"></div>
+        </div>
+
+        <div class="board-wrap">
+          <div class="board" id="board">
+            <div class="cells" id="cells"></div>
+            <div class="fencer f0" id="fencer0">
+              <svg viewBox="0 0 42 50" aria-hidden="true">
+                <circle cx="12" cy="8" r="5.5" fill="currentColor"/>
+                <rect x="6.5" y="14" width="11" height="17" rx="4" fill="currentColor"/>
+                <rect x="3" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
+                <rect x="15" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
+                <line x1="10" y1="20" x2="36" y2="3" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                <circle cx="37.5" cy="2" r="2.5" fill="currentColor"/>
+              </svg>
+            </div>
+            <div class="fencer f1" id="fencer1">
+              <svg viewBox="0 0 42 50" aria-hidden="true">
+                <circle cx="12" cy="8" r="5.5" fill="currentColor"/>
+                <rect x="6.5" y="14" width="11" height="17" rx="4" fill="currentColor"/>
+                <rect x="3" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
+                <rect x="15" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
+                <line x1="10" y1="20" x2="36" y2="3" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                <circle cx="37.5" cy="2" r="2.5" fill="currentColor"/>
+              </svg>
+            </div>
+            <div class="flash" id="flash"></div>
+          </div>
+          <div class="board-scale">
+            <span>1</span><span>12</span><span>23</span>
+          </div>
+        </div>
+
+        <div class="turn-banner" id="turn-banner">あなたの番</div>
+
+        <div class="side my-side">
+          <div class="side-label"><span>あなたの手札</span></div>
+          <div class="my-hand" id="my-hand"></div>
+        </div>
+
+        <div class="actions" id="actions">
+          <div class="action-hint" id="action-hint">カードを選んでください</div>
+          <div class="action-buttons">
+            <button id="move-forward" class="btn btn-move" disabled>前進 <i></i></button>
+            <button id="move-backward" class="btn btn-move" disabled>後退 <i></i></button>
+            <button id="attack-btn" class="btn btn-attack" disabled>攻撃</button>
+            <div class="count-stepper hidden" id="count-stepper">
+              <button id="count-minus" class="step-btn">−</button>
+              <span id="count-value">×1</span>
+              <button id="count-plus" class="step-btn">＋</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="log-wrap">
+          <div class="log-title">行動ログ</div>
+          <div class="log" id="log"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== モーダル ===================== -->
+    <div id="modal-root" class="modal-root hidden">
+      <div class="modal" id="modal">
+        <h2 id="modal-title"></h2>
+        <div id="modal-body"></div>
+        <div id="modal-actions" class="modal-actions"></div>
+      </div>
+    </div>
+
+    <div id="replaced-overlay" class="replaced-overlay hidden">
+      <div class="replaced-card">
+        <h2>切断されました</h2>
+        <p>別のタブで開かれたため切断しました。</p>
+        <p class="replaced-sub">このタブからは対戦を操作できません。</p>
+        <button id="replaced-ok" class="btn btn-primary btn-block">ロビーへ戻る</button>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

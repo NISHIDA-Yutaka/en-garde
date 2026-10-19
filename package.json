@@ -1,0 +1,13 @@
+{
+  "name": "en-garde-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "MSG_RATE=100000 MSG_BURST=100000 node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  }
+}
