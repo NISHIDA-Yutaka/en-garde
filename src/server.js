@@ -1,492 +1,388 @@
-// En Garde Web サーバー: 静的ファイル配信 + WebSocket ルーム管理
-// サーバーが唯一の正（クライアントの判定は信用しない）。
+// アンギャルド対戦サーバー: public/ の静的ファイルと、WebSocket（/ws）の対戦部屋。
+// 勝敗の判定はすべてサーバーで行い、クライアントにはそれぞれの viewFor だけを送る。
 import http from 'node:http';
-import fs from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { createMatch, applyAction, startNextRound, viewFor } from './engine.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PUBLIC_DIR = path.join(__dirname, '..', 'public');
-const ENGINE_PATH = path.join(__dirname, 'engine.js');
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.resolve(ROOT, '../public');
 
 const PORT = process.env.PORT === undefined ? 8080 : Number(process.env.PORT);
 const HOST = process.env.HOST || '127.0.0.1';
 
-const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 0 O 1 I を除く
-
-// 荒らし対策（インターネットに公開するため）。環境変数で変えられる
 const envInt = (name, fallback) => {
   const n = Number(process.env[name]);
   return Number.isInteger(n) && n > 0 ? n : fallback;
 };
-const MAX_ROOMS = envInt('MAX_ROOMS', 300); // サーバー全体の部屋数
-const MAX_CONNECTIONS = envInt('MAX_CONNECTIONS', 1000); // サーバー全体の同時接続数
-const MAX_CONN_PER_IP = envInt('MAX_CONN_PER_IP', 16); // 1つの IP からの同時接続数
-const CREATE_LIMIT = envInt('CREATE_LIMIT', 20); // 1つの IP が CREATE_WINDOW_MS の間に作れる部屋数
-const CREATE_WINDOW_MS = 10 * 60 * 1000;
-const MSG_RATE = envInt('MSG_RATE', 10); // 1接続あたり毎秒のメッセージ数（平均）
-const MSG_BURST = envInt('MSG_BURST', 30); // 一度に送れるメッセージ数
-const HEARTBEAT_MS = 30 * 1000; // 応答のない接続を切る間隔
 
-const MIME = {
+// 部屋と荒らし対策の設定（インターネットに公開しているため）
+const LIMITS = {
+  roomTtlMs: 2 * 60 * 60 * 1000, // 誰もいない部屋を消すまで
+  maxRooms: envInt('MAX_ROOMS', 300),
+  maxConnections: envInt('MAX_CONNECTIONS', 1000),
+  maxConnPerIp: envInt('MAX_CONN_PER_IP', 16),
+  createPerWindow: envInt('CREATE_LIMIT', 20), // 1つの IP が10分間に作れる部屋数
+  createWindowMs: 10 * 60 * 1000,
+  msgRate: envInt('MSG_RATE', 10), // 1接続あたり毎秒（平均）
+  msgBurst: envInt('MSG_BURST', 30),
+  heartbeatMs: 30 * 1000,
+};
+
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 0 O 1 I を除く
+const DEFAULT_NAMES = ['プレイヤー1', 'プレイヤー2'];
+
+// ------------------------------------------------------------------ HTTP
+
+const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
   '.ico': 'image/x-icon',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.txt': 'text/plain; charset=utf-8',
+  '.webmanifest': 'application/manifest+json',
 };
 
-// ---------------------------------------------------------------- HTTP
+async function handleHttp(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { Allow: 'GET, HEAD' }).end();
+    return;
+  }
+  const { pathname } = new URL(req.url, 'http://localhost');
+  if (pathname === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(req.method === 'HEAD' ? undefined : 'ok');
+    return;
+  }
 
-function sendNotFound(res) {
-  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('404 Not Found');
-}
-
-function serveFile(res, filePath, contentType, headOnly) {
-  fs.readFile(filePath, (error, data) => {
-    if (error) {
-      sendNotFound(res);
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-cache' });
-    res.end(headOnly ? undefined : data);
-  });
-}
-
-function contentTypeFor(filePath) {
-  return MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+  let file;
+  try {
+    const rel = decodeURIComponent(pathname === '/' ? '/index.html' : pathname);
+    file = path.resolve(PUBLIC_DIR, `.${rel}`);
+  } catch {
+    file = null;
+  }
+  const type = file && TYPES[path.extname(file)];
+  if (!type || !file.startsWith(PUBLIC_DIR + path.sep)) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('見つかりません');
+    return;
+  }
+  try {
+    const body = await readFile(file);
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+    res.end(req.method === 'HEAD' ? undefined : body);
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('見つかりません');
+  }
 }
 
 const server = http.createServer((req, res) => {
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    sendNotFound(res);
-    return;
-  }
-  const rawPath = (req.url || '/').split('?')[0];
-  const headOnly = req.method === 'HEAD';
-
-  if (rawPath === '/healthz') {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(headOnly ? undefined : 'ok');
-    return;
-  }
-
-  if (rawPath === '/engine.js') {
-    serveFile(res, ENGINE_PATH, MIME['.js'], headOnly);
-    return;
-  }
-
-  let decoded;
-  try {
-    decoded = decodeURIComponent(rawPath);
-  } catch {
-    sendNotFound(res);
-    return;
-  }
-
-  if (decoded === '/' || decoded === '') decoded = '/index.html';
-
-  const resolved = path.normalize(path.join(PUBLIC_DIR, decoded));
-  if (resolved !== PUBLIC_DIR && !resolved.startsWith(PUBLIC_DIR + path.sep)) {
-    sendNotFound(res);
-    return;
-  }
-  serveFile(res, resolved, contentTypeFor(resolved), headOnly);
+  handleHttp(req, res).catch(() => {
+    if (!res.headersSent) res.writeHead(500);
+    res.end();
+  });
 });
 
-// ------------------------------------------------------------- room state
+// ------------------------------------------------------------------ 部屋
 
-/** @type {Map<string, object>} */
+/** @type {Map<string, Room>} */
 const rooms = new Map();
 
-/** IP ごとの同時接続数 @type {Map<string, number>} */
-const connectionsByIp = new Map();
-/** IP ごとの部屋作成時刻 @type {Map<string, number[]>} */
-const createsByIp = new Map();
+/**
+ * @typedef {object} Room
+ * @property {string} code
+ * @property {(string|null)[]} names
+ * @property {(string|null)[]} tokens
+ * @property {(import('ws').WebSocket|null)[]} sockets
+ * @property {object|null} match
+ * @property {number} seq  状態が変わるたびに増える番号（クライアントが演出の重複を防ぐのに使う）
+ * @property {boolean[]} ready  ラウンド結果やマッチ結果を見終わったか
+ * @property {number} firstPlayer
+ * @property {number} touchedAt
+ */
 
-// Caddy などの逆プロキシ越しなら X-Forwarded-For の最後（プロキシが付けた値）を使う。
-// 直接つながっているのが自分（ループバック）のときだけ信用する
-function clientIp(req) {
-  const remote = req.socket.remoteAddress || '';
-  const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
-  const forwarded = req.headers['x-forwarded-for'];
-  if (loopback && typeof forwarded === 'string' && forwarded.trim()) {
-    const parts = forwarded.split(',');
-    return parts[parts.length - 1].trim();
-  }
-  return remote;
-}
-
-function allowCreate(ip) {
-  const now = Date.now();
-  const recent = (createsByIp.get(ip) || []).filter((t) => now - t < CREATE_WINDOW_MS);
-  if (recent.length >= CREATE_LIMIT) {
-    createsByIp.set(ip, recent);
-    return false;
-  }
-  recent.push(now);
-  createsByIp.set(ip, recent);
-  return true;
-}
-
-function randomCode(length) {
-  let code = '';
-  for (let i = 0; i < length; i += 1) {
-    code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
-  }
-  return code;
-}
-
-function makeUniqueRoomCode() {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const code = randomCode(5);
+function newRoomCode() {
+  for (;;) {
+    let code = '';
+    for (let i = 0; i < 5; i += 1) code += CODE_CHARS[randomInt(CODE_CHARS.length)];
     if (!rooms.has(code)) return code;
   }
-  return randomCode(8);
 }
 
-function makeToken() {
-  return randomBytes(24).toString('base64url');
-}
+const newToken = () => randomBytes(24).toString('base64url');
 
-function cleanName(name, fallback) {
-  const text = typeof name === 'string' ? name.trim() : '';
-  return text.slice(0, 16) || fallback;
-}
-
-function touch(room) {
-  room.lastActivity = Date.now();
+function cleanName(name, seat) {
+  const text = typeof name === 'string' ? name.trim().slice(0, 16) : '';
+  return text || DEFAULT_NAMES[seat];
 }
 
 function send(ws, message) {
-  if (ws && ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify(message));
-  }
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
 }
 
 function broadcastState(room) {
-  for (let player = 0; player < 2; player += 1) {
-    const ws = room.sockets[player];
-    if (!ws) continue;
+  room.touchedAt = Date.now();
+  room.sockets.forEach((ws, seat) => {
     send(ws, {
       t: 'state',
       seq: room.seq,
-      view: room.match ? viewFor(room.match, player) : null,
-      names: [room.names[0], room.names[1]],
+      view: room.match ? viewFor(room.match, seat) : null,
+      names: [...room.names],
       ready: [...room.ready],
     });
-  }
+  });
 }
 
-function sendPresence(room) {
-  const message = { t: 'presence', connected: [!!room.sockets[0], !!room.sockets[1]] };
-  send(room.sockets[0], message);
-  send(room.sockets[1], message);
-}
-
-function createRoom(name, ws) {
-  const code = makeUniqueRoomCode();
-  const room = {
-    code,
-    names: [name, null],
-    tokens: [makeToken(), null],
-    sockets: [ws, null],
-    match: null,
-    seq: 0,
-    ready: [false, false],
-    rematch: [false, false],
-    firstPlayer: 0,
-    lastActivity: Date.now(),
-  };
-  rooms.set(code, room);
-  return room;
-}
-
-function detach(ws) {
-  const room = rooms.get(ws._room);
-  if (!room) return;
-  const player = ws._player;
-  if (player != null && room.sockets[player] === ws) {
-    room.sockets[player] = null;
-    touch(room);
-    sendPresence(room);
-  }
+function broadcastPresence(room) {
+  const message = { t: 'presence', connected: room.sockets.map(Boolean) };
+  room.sockets.forEach((ws) => send(ws, message));
 }
 
 function startMatch(room, firstPlayer) {
   room.firstPlayer = firstPlayer;
   room.match = createMatch({ firstPlayer });
-  room.seq += 1;
   room.ready = [false, false];
-  room.rematch = [false, false];
-}
-
-// ------------------------------------------------------- message handling
-
-function handleCreate(ws, msg) {
-  if (rooms.size >= MAX_ROOMS) sweepRooms(0);
-  if (rooms.size >= MAX_ROOMS) {
-    send(ws, { t: 'error', message: 'サーバーが混み合っています。しばらくしてから試してください' });
-    return;
-  }
-  if (!allowCreate(ws._ip)) {
-    send(ws, { t: 'error', message: '部屋を作りすぎです。しばらくしてから試してください' });
-    return;
-  }
-  detach(ws);
-  const name = cleanName(msg.name, 'プレイヤー1');
-  const room = createRoom(name, ws);
-  ws._room = room.code;
-  ws._player = 0;
-  ws._token = room.tokens[0];
-  send(ws, { t: 'created', room: room.code, token: room.tokens[0], player: 0 });
-  broadcastState(room);
-  sendPresence(room);
-}
-
-function handleJoin(ws, msg) {
-  const room = rooms.get(msg.room);
-  if (!room) {
-    send(ws, { t: 'error', message: '部屋が見つかりません' });
-    return;
-  }
-  if (room.tokens[1] !== null) {
-    send(ws, { t: 'error', message: 'この部屋は満員です' });
-    return;
-  }
-  detach(ws);
-  const name = cleanName(msg.name, 'プレイヤー2');
-  const token = makeToken();
-  room.names[1] = name;
-  room.tokens[1] = token;
-  room.sockets[1] = ws;
-  ws._room = room.code;
-  ws._player = 1;
-  ws._token = token;
-  touch(room);
-  send(ws, { t: 'joined', room: room.code, token, player: 1 });
-  if (!room.match) startMatch(room, 0);
-  broadcastState(room);
-  sendPresence(room);
-}
-
-function handleResume(ws, msg) {
-  const room = rooms.get(msg.room);
-  if (!room) {
-    send(ws, { t: 'error', message: '部屋が見つかりません' });
-    return;
-  }
-  const player = room.tokens.indexOf(msg.token);
-  if (player === -1) {
-    send(ws, { t: 'error', message: 'この部屋に復帰できません' });
-    return;
-  }
-  detach(ws);
-  const old = room.sockets[player];
-  room.sockets[player] = ws;
-  ws._room = room.code;
-  ws._player = player;
-  ws._token = msg.token;
-  touch(room);
-  send(ws, { t: 'joined', room: room.code, token: msg.token, player });
-  if (old && old !== ws) {
-    old._superseded = true;
-    try {
-      old.close(4001, 'superseded by another tab');
-    } catch {
-      /* ignore */
-    }
-  }
-  broadcastState(room);
-  sendPresence(room);
-}
-
-function handleAction(ws, msg) {
-  const room = rooms.get(ws._room);
-  if (!room || !room.match) {
-    send(ws, { t: 'error', message: 'ゲームが始まっていません' });
-    return;
-  }
-  const result = applyAction(room.match, ws._player, msg.action);
-  if (!result.ok) {
-    send(ws, { t: 'error', message: result.error });
-    return;
-  }
-  room.match = result.state;
   room.seq += 1;
-  touch(room);
-  broadcastState(room);
 }
 
-function handleNext(ws) {
-  const room = rooms.get(ws._room);
-  if (!room || !room.match) return;
-  if (room.match.phase !== 'roundOver') return;
-  room.ready[ws._player] = true;
-  touch(room);
-  if (room.ready[0] && room.ready[1]) {
-    room.match = startNextRound(room.match, Math.random);
+// この接続を、いま座っている席から外す
+function leaveSeat(ws) {
+  const room = rooms.get(ws.roomCode);
+  if (room && room.sockets[ws.seat] === ws) {
+    room.sockets[ws.seat] = null;
+    room.touchedAt = Date.now();
+    broadcastPresence(room);
+  }
+  ws.roomCode = null;
+  ws.seat = null;
+}
+
+function sit(ws, room, seat) {
+  ws.roomCode = room.code;
+  ws.seat = seat;
+  const previous = room.sockets[seat];
+  room.sockets[seat] = ws;
+  // 同じ席に別のタブから戻ってきたら、古いタブは閉じる（4001 で知らせ、再接続させない）
+  if (previous && previous !== ws) {
+    previous.roomCode = null;
+    previous.close(4001, 'superseded');
+  }
+}
+
+// ------------------------------------------------------------------ 荒らし対策
+
+const connectionsByIp = new Map();
+const createsByIp = new Map();
+
+// Caddy 越しなら X-Forwarded-For の最後（Caddy が付けた本当の相手）を使う。
+// 直接つないできたのが自分自身（ループバック）のときだけ、このヘッダーを信用する
+function clientIp(req) {
+  const remote = req.socket.remoteAddress || '';
+  const forwarded = req.headers['x-forwarded-for'];
+  const viaProxy = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote);
+  if (viaProxy && typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',').at(-1).trim();
+  }
+  return remote;
+}
+
+function mayCreateRoom(ip) {
+  const now = Date.now();
+  const recent = (createsByIp.get(ip) || []).filter((t) => now - t < LIMITS.createWindowMs);
+  const allowed = recent.length < LIMITS.createPerWindow;
+  if (allowed) recent.push(now);
+  createsByIp.set(ip, recent);
+  return allowed;
+}
+
+// 誰もつながっていない部屋のうち、最後の操作から ttl 以上たったものを消す
+function sweepRooms(ttl) {
+  const now = Date.now();
+  for (const [code, room] of rooms) {
+    if (!room.sockets.some(Boolean) && now - room.touchedAt >= ttl) rooms.delete(code);
+  }
+}
+
+// ------------------------------------------------------------------ メッセージ
+
+const handlers = {
+  create(ws, msg) {
+    if (rooms.size >= LIMITS.maxRooms) sweepRooms(0);
+    if (rooms.size >= LIMITS.maxRooms) return '混み合っています。しばらくしてから試してください';
+    if (!mayCreateRoom(ws.ip)) return '部屋を作りすぎです。しばらくしてから試してください';
+    leaveSeat(ws);
+    const room = {
+      code: newRoomCode(),
+      names: [cleanName(msg.name, 0), null],
+      tokens: [newToken(), null],
+      sockets: [null, null],
+      match: null,
+      seq: 0,
+      ready: [false, false],
+      firstPlayer: 0,
+      touchedAt: Date.now(),
+    };
+    rooms.set(room.code, room);
+    sit(ws, room, 0);
+    send(ws, { t: 'created', room: room.code, token: room.tokens[0], player: 0 });
+    broadcastState(room);
+    broadcastPresence(room);
+    return null;
+  },
+
+  join(ws, msg) {
+    const room = rooms.get(String(msg.room ?? '').toUpperCase());
+    if (!room) return '部屋が見つかりません';
+    if (room.tokens[1] !== null) return 'この部屋は満員です';
+    leaveSeat(ws);
+    room.names[1] = cleanName(msg.name, 1);
+    room.tokens[1] = newToken();
+    sit(ws, room, 1);
+    send(ws, { t: 'joined', room: room.code, token: room.tokens[1], player: 1 });
+    startMatch(room, 0);
+    broadcastState(room);
+    broadcastPresence(room);
+    return null;
+  },
+
+  resume(ws, msg) {
+    const room = rooms.get(String(msg.room ?? ''));
+    if (!room) return '部屋が見つかりません';
+    const seat = typeof msg.token === 'string' ? room.tokens.indexOf(msg.token) : -1;
+    if (seat === -1) return 'この部屋には戻れません';
+    if (ws.roomCode !== room.code || ws.seat !== seat) leaveSeat(ws);
+    sit(ws, room, seat);
+    send(ws, { t: 'joined', room: room.code, token: msg.token, player: seat });
+    broadcastState(room);
+    broadcastPresence(room);
+    return null;
+  },
+
+  action(ws, msg) {
+    const room = rooms.get(ws.roomCode);
+    if (!room?.match) return '対戦が始まっていません';
+    const result = applyAction(room.match, ws.seat, msg.action);
+    if (!result.ok) return result.error;
+    room.match = result.state;
     room.seq += 1;
-    room.ready = [false, false];
-  }
-  broadcastState(room);
-}
+    broadcastState(room);
+    return null;
+  },
 
-function handleRematch(ws) {
-  const room = rooms.get(ws._room);
-  if (!room || !room.match) return;
-  if (room.match.phase !== 'matchOver') return;
-  room.rematch[ws._player] = true;
-  room.ready[ws._player] = true;
-  touch(room);
-  if (room.rematch[0] && room.rematch[1]) {
-    startMatch(room, 1 - room.firstPlayer);
-  }
-  broadcastState(room);
-}
+  next(ws) {
+    const room = rooms.get(ws.roomCode);
+    if (room?.match?.phase !== 'roundOver') return null;
+    room.ready[ws.seat] = true;
+    if (room.ready.every(Boolean)) {
+      room.match = startNextRound(room.match);
+      room.ready = [false, false];
+      room.seq += 1;
+    }
+    broadcastState(room);
+    return null;
+  },
 
-function handleMessage(ws, msg) {
-  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
-    send(ws, { t: 'error', message: 'メッセージの形式が不正です' });
+  rematch(ws) {
+    const room = rooms.get(ws.roomCode);
+    if (room?.match?.phase !== 'matchOver') return null;
+    room.ready[ws.seat] = true;
+    if (room.ready.every(Boolean)) startMatch(room, 1 - room.firstPlayer);
+    broadcastState(room);
+    return null;
+  },
+};
+
+function handleMessage(ws, data) {
+  let msg;
+  try {
+    msg = JSON.parse(String(data));
+  } catch {
+    send(ws, { t: 'error', message: 'メッセージを読み取れませんでした' });
     return;
   }
-  switch (msg.t) {
-    case 'create':
-      handleCreate(ws, msg);
-      break;
-    case 'join':
-      handleJoin(ws, msg);
-      break;
-    case 'resume':
-      handleResume(ws, msg);
-      break;
-    case 'action':
-      handleAction(ws, msg);
-      break;
-    case 'next':
-      handleNext(ws);
-      break;
-    case 'rematch':
-      handleRematch(ws);
-      break;
-    default:
-      send(ws, { t: 'error', message: '不明なメッセージです' });
+  const handler = msg && typeof msg === 'object' && Object.hasOwn(handlers, msg.t) ? handlers[msg.t] : null;
+  if (!handler) {
+    send(ws, { t: 'error', message: '知らないメッセージです' });
+    return;
   }
+  let error;
+  try {
+    error = handler(ws, msg);
+  } catch {
+    error = 'サーバーでエラーが起きました';
+  }
+  if (error) send(ws, { t: 'error', message: error });
 }
 
-// ------------------------------------------------------------ websocket
+// ------------------------------------------------------------------ WebSocket
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 4096 });
 
 wss.on('connection', (ws, req) => {
-  ws._room = null;
-  ws._player = null;
-  ws._superseded = false;
-  ws._ip = clientIp(req);
-  ws.on('error', () => {
-    /* ソケットエラーは無視（close で処理する） */
-  });
+  ws.on('error', () => {}); // close で後片付けする
+  ws.ip = clientIp(req);
+  ws.roomCode = null;
+  ws.seat = null;
 
-  const count = connectionsByIp.get(ws._ip) || 0;
-  if (wss.clients.size > MAX_CONNECTIONS || count >= MAX_CONN_PER_IP) {
+  const fromIp = connectionsByIp.get(ws.ip) || 0;
+  if (wss.clients.size > LIMITS.maxConnections || fromIp >= LIMITS.maxConnPerIp) {
     ws.close(1013, 'too many connections');
     return;
   }
-  connectionsByIp.set(ws._ip, count + 1);
+  connectionsByIp.set(ws.ip, fromIp + 1);
 
-  ws._alive = true;
+  ws.alive = true;
   ws.on('pong', () => {
-    ws._alive = true;
+    ws.alive = true;
   });
 
   // メッセージの連打を制限する（トークンバケット）
-  let tokens = MSG_BURST;
-  let refilledAt = Date.now();
-
+  let tokens = LIMITS.msgBurst;
+  let lastRefill = Date.now();
   ws.on('message', (data) => {
     const now = Date.now();
-    tokens = Math.min(MSG_BURST, tokens + ((now - refilledAt) / 1000) * MSG_RATE);
-    refilledAt = now;
+    tokens = Math.min(LIMITS.msgBurst, tokens + ((now - lastRefill) / 1000) * LIMITS.msgRate);
+    lastRefill = now;
     if (tokens < 1) {
       ws.close(1008, 'too many messages');
       return;
     }
     tokens -= 1;
-
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      send(ws, { t: 'error', message: 'メッセージを解析できません' });
-      return;
-    }
-    try {
-      handleMessage(ws, msg);
-    } catch {
-      send(ws, { t: 'error', message: 'サーバー内部エラー' });
-    }
+    handleMessage(ws, data);
   });
 
   ws.on('close', () => {
-    detach(ws);
-    const left = (connectionsByIp.get(ws._ip) || 1) - 1;
-    if (left > 0) connectionsByIp.set(ws._ip, left);
-    else connectionsByIp.delete(ws._ip);
+    leaveSeat(ws);
+    const left = (connectionsByIp.get(ws.ip) || 1) - 1;
+    if (left > 0) connectionsByIp.set(ws.ip, left);
+    else connectionsByIp.delete(ws.ip);
   });
 });
 
-// 応答のない接続（回線が切れたままのもの）を切る
-const heartbeat = setInterval(() => {
+// 回線が切れたまま応答しない接続を切る
+setInterval(() => {
   for (const ws of wss.clients) {
-    if (!ws._alive) {
+    if (!ws.alive) {
       ws.terminate();
       continue;
     }
-    ws._alive = false;
+    ws.alive = false;
     ws.ping();
   }
-}, HEARTBEAT_MS);
-heartbeat.unref?.();
+}, LIMITS.heartbeatMs).unref();
 
-// 誰もつながっていない部屋を、最後の操作から ttl ミリ秒たったら消す
-function sweepRooms(ttl) {
-  const now = Date.now();
-  for (const [code, room] of rooms) {
-    const connected = room.sockets[0] || room.sockets[1];
-    if (!connected && now - room.lastActivity >= ttl) {
-      rooms.delete(code);
-    }
-  }
-}
-
-// 2 時間アクセスのない部屋と、古い部屋作成の記録を掃除する
-const cleaner = setInterval(() => {
-  sweepRooms(ROOM_TTL_MS);
+setInterval(() => {
+  sweepRooms(LIMITS.roomTtlMs);
   const now = Date.now();
   for (const [ip, times] of createsByIp) {
-    if (times.every((t) => now - t >= CREATE_WINDOW_MS)) createsByIp.delete(ip);
+    if (times.every((t) => now - t >= LIMITS.createWindowMs)) createsByIp.delete(ip);
   }
-}, 10 * 60 * 1000);
-cleaner.unref?.();
+}, 10 * 60 * 1000).unref();
 
 server.listen(PORT, HOST, () => {
-  const address = server.address();
-  const actualPort = typeof address === 'object' && address ? address.port : PORT;
-  console.log(`LISTENING ${actualPort}`);
+  console.log(`LISTENING ${server.address().port}`);
 });
-
-export { server, wss };

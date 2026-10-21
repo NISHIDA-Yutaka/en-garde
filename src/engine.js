@@ -1,306 +1,216 @@
-// アンギャルド（En Garde）ルールエンジン
-// 純粋関数のみ。引数の state は変更せず、新しい state を返す。
-// Node でもブラウザでも動く ES Module（Node 専用 API を使わない）。
+// アンギャルド（En Garde）基本ルールのエンジン。
+// state はプレーンなオブジェクトで、どの関数も引数を変更せずに新しい state を返す。
+// Node でもブラウザでも動くよう、Node 専用の API は使わない。
 
-const BOARD_MIN = 1;
-const BOARD_MAX = 23;
-const HAND_SIZE = 5;
-const CARD_VALUES = 5;
+export const FIRST_CELL = 1;
+export const LAST_CELL = 23;
+export const HAND_SIZE = 5;
+export const MAX_CARD = 5;
+export const WIN_SCORE = 5;
+
 const COPIES = 5;
-const WIN_SCORE = 5;
 
-const ok = (state) => ({ ok: true, state });
-const err = (error) => ({ ok: false, error });
+const distanceOf = (state) => state.positions[1] - state.positions[0];
+const countOf = (hand, value) => hand.filter((c) => c === value).length;
+const fail = (error) => ({ ok: false, error });
 
-function clone(value) {
-  return structuredClone(value);
-}
+// 各プレイヤーの「前」の向き。プレイヤー0は右（+1）、プレイヤー1は左（-1）
+const facing = (player) => (player === 0 ? 1 : -1);
 
-function distance(state) {
-  return Math.abs(state.positions[1] - state.positions[0]);
-}
-
-function countIn(hand, value) {
-  let n = 0;
-  for (const c of hand) if (c === value) n += 1;
-  return n;
-}
-
-// hand から value を k 枚取り出す。取り出した配列と残りを返す。
-function takeCards(hand, value, k) {
-  const rest = [];
-  const taken = [];
-  for (const c of hand) {
-    if (c === value && taken.length < k) taken.push(c);
-    else rest.push(c);
-  }
-  return { rest, taken };
-}
-
-function buildShuffledDeck(rng) {
+function shuffledDeck(rng) {
   const cards = [];
-  for (let v = 1; v <= CARD_VALUES; v += 1) {
-    for (let i = 0; i < COPIES; i += 1) cards.push(v);
-  }
+  for (let v = 1; v <= MAX_CARD; v += 1) for (let i = 0; i < COPIES; i += 1) cards.push(v);
   for (let i = cards.length - 1; i > 0; i -= 1) {
     const j = Math.floor(rng() * (i + 1));
-    const tmp = cards[i];
-    cards[i] = cards[j];
-    cards[j] = tmp;
+    [cards[i], cards[j]] = [cards[j], cards[i]];
   }
   return cards;
 }
 
-function dealFrom(cards) {
+function freshRound(rng, startPlayer) {
+  const cards = shuffledDeck(rng);
   return {
+    startPlayer,
+    positions: [FIRST_CELL, LAST_CELL],
     hands: [cards.slice(0, HAND_SIZE), cards.slice(HAND_SIZE, HAND_SIZE * 2)],
     deck: cards.slice(HAND_SIZE * 2),
+    discard: [],
+    turn: startPlayer,
+    phase: 'action',
+    parried: null,
+    roundResult: null,
+    lastEvents: [],
   };
 }
 
 export function createMatch({ rng = Math.random, firstPlayer = 0 } = {}) {
-  const cards = buildShuffledDeck(rng);
-  const { hands, deck } = dealFrom(cards);
-  return {
-    round: 1,
-    startPlayer: firstPlayer,
-    scores: [0, 0],
-    positions: [1, BOARD_MAX],
-    hands,
-    deck,
-    discard: [],
-    turn: firstPlayer,
-    phase: 'action',
-    parried: null,
-    roundResult: null,
-    winner: null,
-    lastEvents: [],
-  };
-}
-
-function moveTarget(state, player, dir, card) {
-  const from = state.positions[player];
-  const sign = player === 0 ? 1 : -1;
-  const delta = (dir === 'forward' ? 1 : -1) * sign * card;
-  return from + delta;
-}
-
-function isLegalMove(state, player, dir, card) {
-  const to = moveTarget(state, player, dir, card);
-  if (to < BOARD_MIN || to > BOARD_MAX) return false;
-  const opponent = state.positions[1 - player];
-  if (dir === 'forward') {
-    // 相手のマスに止まる・相手を飛び越える移動は不可
-    if (player === 0 && to >= opponent) return false;
-    if (player === 1 && to <= opponent) return false;
-  }
-  return true;
-}
-
-export function legalActions(state, player) {
-  if (player !== 0 && player !== 1) return [];
-  if (state.phase !== 'action') return [];
-  if (state.turn !== player) return [];
-
-  const actions = [];
-  const hand = state.hands[player];
-
-  const seen = new Set();
-  for (const card of hand) {
-    if (seen.has(card)) continue;
-    seen.add(card);
-    if (isLegalMove(state, player, 'forward', card)) {
-      actions.push({ type: 'move', dir: 'forward', card });
-    }
-    if (isLegalMove(state, player, 'backward', card)) {
-      actions.push({ type: 'move', dir: 'backward', card });
-    }
-  }
-
-  const d = distance(state);
-  const available = countIn(hand, d);
-  for (let k = 1; k <= available; k += 1) {
-    actions.push({ type: 'attack', value: d, count: k });
-  }
-  return actions;
-}
-
-function replenish(state, player) {
-  const need = HAND_SIZE - state.hands[player].length;
-  if (need <= 0) return;
-  const draw = state.deck.slice(0, need);
-  state.deck = state.deck.slice(need);
-  state.hands[player] = [...state.hands[player], ...draw];
-}
-
-function judgeDeck(state) {
-  const d = distance(state);
-  const c0 = countIn(state.hands[0], d);
-  const c1 = countIn(state.hands[1], d);
-  if (c0 > c1) return 0;
-  if (c1 > c0) return 1;
-  const advance0 = state.positions[0] - BOARD_MIN;
-  const advance1 = BOARD_MAX - state.positions[1];
-  if (advance0 > advance1) return 0;
-  if (advance1 > advance0) return 1;
-  return null;
-}
-
-function endRound(state, winner, reason, events, revealedHands) {
-  const roundResult = { winner, reason };
-  if (reason === 'deck' && revealedHands) {
-    roundResult.revealedHands = revealedHands.map((h) => h.slice());
-  }
-  state.roundResult = roundResult;
-  state.phase = 'roundOver';
-  state.parried = null;
-  if (winner !== null) {
-    state.scores = [...state.scores];
-    state.scores[winner] += 1;
-  }
-  events.push({ type: 'roundEnd', winner, reason });
-  if (winner !== null && state.scores[winner] >= WIN_SCORE) {
-    state.winner = winner;
-    state.phase = 'matchOver';
-    events.push({ type: 'matchEnd', winner });
-  }
-}
-
-function finishByDeck(state, events) {
-  const winner = judgeDeck(state);
-  endRound(state, winner, 'deck', events, [state.hands[0], state.hands[1]]);
-}
-
-function checkStuck(state, events) {
-  const player = state.turn;
-  if (legalActions(state, player).length === 0) {
-    events.push({ type: 'stuck', player });
-    endRound(state, 1 - player, 'stuck', events);
-  }
-}
-
-function applyMove(state, player, action) {
-  const { dir, card } = action;
-  if (dir !== 'forward' && dir !== 'backward') return err('移動方向が不正です');
-  if (!Number.isInteger(card) || card < 1 || card > CARD_VALUES) {
-    return err('カードの値が不正です');
-  }
-  if (!state.hands[player].includes(card)) return err('そのカードを持っていません');
-  if (!isLegalMove(state, player, dir, card)) {
-    return err('そこへは移動できません');
-  }
-
-  const s = clone(state);
-  s.parried = null;
-  const from = s.positions[player];
-  const to = moveTarget(s, player, dir, card);
-
-  const { rest, taken } = takeCards(s.hands[player], card, 1);
-  s.hands = [...s.hands];
-  s.hands[player] = rest;
-  s.discard = [...s.discard, ...taken];
-  s.positions = [...s.positions];
-  s.positions[player] = to;
-
-  const events = [{ type: 'move', player, dir, card, from, to }];
-  const deckBefore = s.deck.length;
-  replenish(s, player);
-  const deckOut = deckBefore > 0 && s.deck.length === 0;
-  if (deckOut) events.push({ type: 'deckOut' });
-
-  s.turn = 1 - player;
-  if (deckOut) {
-    finishByDeck(s, events);
-  } else {
-    checkStuck(s, events);
-  }
-  s.lastEvents = events;
-  return ok(s);
-}
-
-function applyAttack(state, player, action) {
-  const { value, count } = action;
-  const d = distance(state);
-  if (!Number.isInteger(value) || value < 1 || value > CARD_VALUES || value !== d) {
-    return err('攻撃は現在の距離とちょうどの数字のカードで行います');
-  }
-  if (!Number.isInteger(count) || count < 1) return err('攻撃の枚数が不正です');
-  if (countIn(state.hands[player], d) < count) {
-    return err('その数字のカードが足りません');
-  }
-
-  const s = clone(state);
-  s.parried = null;
-
-  const { rest, taken } = takeCards(s.hands[player], d, count);
-  s.hands = [...s.hands];
-  s.hands[player] = rest;
-  s.discard = [...s.discard, ...taken];
-
-  const events = [{ type: 'attack', player, value: d, count }];
-  const deckBefore = s.deck.length;
-  replenish(s, player);
-  const deckOut = deckBefore > 0 && s.deck.length === 0;
-  if (deckOut) events.push({ type: 'deckOut' });
-
-  const opponent = 1 - player;
-  const canParry = countIn(s.hands[opponent], d) >= count;
-
-  if (canParry) {
-    const parsed = takeCards(s.hands[opponent], d, count);
-    s.hands[opponent] = parsed.rest;
-    s.discard = [...s.discard, ...parsed.taken];
-    events.push({ type: 'parry', player: opponent, value: d, count });
-    s.turn = opponent;
-    if (deckOut) {
-      // パリィ後の手番は行わず、そのまま山札切れ判定へ
-      finishByDeck(s, events);
-    } else {
-      s.parried = opponent;
-      checkStuck(s, events);
-    }
-  } else {
-    events.push({ type: 'hit', player });
-    s.turn = opponent;
-    endRound(s, player, 'hit', events);
-  }
-
-  s.lastEvents = events;
-  return ok(s);
-}
-
-export function applyAction(state, player, action) {
-  if (state.phase !== 'action') return err('今は行動できません');
-  if (player !== 0 && player !== 1) return err('プレイヤーが不正です');
-  if (state.turn !== player) return err('あなたの手番ではありません');
-  if (action === null || typeof action !== 'object' || Array.isArray(action)) {
-    return err('行動の形式が不正です');
-  }
-  if (action.type === 'move') return applyMove(state, player, action);
-  if (action.type === 'attack') return applyAttack(state, player, action);
-  return err('不明な行動です');
+  return { round: 1, scores: [0, 0], winner: null, ...freshRound(rng, firstPlayer) };
 }
 
 export function startNextRound(state, rng = Math.random) {
   if (state.phase !== 'roundOver') return state;
-  const cards = buildShuffledDeck(rng);
-  const { hands, deck } = dealFrom(cards);
-  const firstPlayer = 1 - state.startPlayer;
   return {
     round: state.round + 1,
-    startPlayer: firstPlayer,
     scores: [...state.scores],
-    positions: [1, BOARD_MAX],
-    hands,
-    deck,
-    discard: [],
-    turn: firstPlayer,
-    phase: 'action',
-    parried: null,
-    roundResult: null,
     winner: null,
-    lastEvents: [],
+    ...freshRound(rng, 1 - state.startPlayer),
   };
+}
+
+// 移動先のマス。動けないなら null
+function moveTarget(state, player, dir, card) {
+  const step = (dir === 'forward' ? 1 : -1) * facing(player) * card;
+  const to = state.positions[player] + step;
+  if (to < FIRST_CELL || to > LAST_CELL) return null;
+  const other = state.positions[1 - player];
+  // 相手のマスに止まる・飛び越えるのは、相手側へ進むときだけ起こる
+  if (player === 0 ? to >= other : to <= other) return null;
+  return to;
+}
+
+export function legalActions(state, player) {
+  if (state.phase !== 'action' || state.turn !== player) return [];
+  const hand = state.hands[player];
+  const actions = [];
+  for (const card of [...new Set(hand)].sort((a, b) => a - b)) {
+    for (const dir of ['forward', 'backward']) {
+      if (moveTarget(state, player, dir, card) !== null) actions.push({ type: 'move', dir, card });
+    }
+  }
+  const d = distanceOf(state);
+  const have = countOf(hand, d);
+  for (let count = 1; count <= have; count += 1) actions.push({ type: 'attack', value: d, count });
+  return actions;
+}
+
+// --- 状態を書き換える小さな手続き（applyAction の中で、コピーした state にだけ使う）
+
+function removeCards(state, player, value, count) {
+  const hand = [...state.hands[player]];
+  for (let i = 0; i < count; i += 1) hand.splice(hand.indexOf(value), 1);
+  state.hands[player] = hand;
+  state.discard.push(...Array(count).fill(value));
+}
+
+// 手札を5枚まで引く。この補充で山札が尽きたら true
+function refill(state, player) {
+  const need = HAND_SIZE - state.hands[player].length;
+  if (need <= 0 || state.deck.length === 0) return false;
+  state.hands[player] = [...state.hands[player], ...state.deck.slice(0, need)];
+  state.deck = state.deck.slice(need);
+  return state.deck.length === 0;
+}
+
+function finishRound(state, winner, reason, events) {
+  state.phase = 'roundOver';
+  state.parried = null;
+  state.roundResult = { winner, reason };
+  if (reason === 'deck') state.roundResult.revealedHands = state.hands.map((h) => [...h]);
+  if (winner !== null) state.scores[winner] += 1;
+  events.push({ type: 'roundEnd', winner, reason });
+  if (winner !== null && state.scores[winner] >= WIN_SCORE) {
+    state.phase = 'matchOver';
+    state.winner = winner;
+    events.push({ type: 'matchEnd', winner });
+  }
+}
+
+// 山札切れの判定: 距離ちょうどの札が多い方 → 前進した距離が長い方 → 引き分け
+export function judgeDeckOut(positions, hands) {
+  const d = positions[1] - positions[0];
+  const counts = hands.map((h) => countOf(h, d));
+  if (counts[0] !== counts[1]) return counts[0] > counts[1] ? 0 : 1;
+  const advance = [positions[0] - FIRST_CELL, LAST_CELL - positions[1]];
+  if (advance[0] !== advance[1]) return advance[0] > advance[1] ? 0 : 1;
+  return null;
+}
+
+// 手番を相手に渡す。相手が何もできなければ、その時点で相手の負け
+function passTurn(state, player, events) {
+  state.turn = 1 - player;
+  if (legalActions(state, state.turn).length === 0) {
+    events.push({ type: 'stuck', player: state.turn });
+    finishRound(state, player, 'stuck', events);
+  }
+}
+
+function copyForUpdate(state) {
+  return {
+    ...state,
+    scores: [...state.scores],
+    positions: [...state.positions],
+    hands: state.hands.map((h) => [...h]),
+    deck: [...state.deck],
+    discard: [...state.discard],
+  };
+}
+
+const isCard = (n) => Number.isInteger(n) && n >= 1 && n <= MAX_CARD;
+
+export function applyAction(state, player, action) {
+  if (player !== 0 && player !== 1) return fail('プレイヤーが正しくありません');
+  if (state.phase !== 'action') return fail('いまは行動できません');
+  if (state.turn !== player) return fail('あなたの手番ではありません');
+  if (!action || typeof action !== 'object') return fail('行動の形式が正しくありません');
+
+  const hand = state.hands[player];
+  const events = [];
+  let s;
+
+  if (action.type === 'move') {
+    const { dir, card } = action;
+    if (dir !== 'forward' && dir !== 'backward') return fail('移動の向きが正しくありません');
+    if (!isCard(card)) return fail('カードの数字が正しくありません');
+    if (!hand.includes(card)) return fail('そのカードは持っていません');
+    const to = moveTarget(state, player, dir, card);
+    if (to === null) return fail('そのマスには移動できません');
+
+    s = copyForUpdate(state);
+    events.push({ type: 'move', player, dir, card, from: s.positions[player], to });
+    s.positions[player] = to;
+    removeCards(s, player, card, 1);
+  } else if (action.type === 'attack') {
+    const { value, count } = action;
+    const d = distanceOf(state);
+    if (!isCard(value) || value !== d) return fail(`攻撃には距離と同じ「${d}」のカードが必要です`);
+    if (!Number.isInteger(count) || count < 1) return fail('攻撃の枚数が正しくありません');
+    if (countOf(hand, value) < count) return fail(`「${value}」が${count}枚ありません`);
+
+    s = copyForUpdate(state);
+    events.push({ type: 'attack', player, value, count });
+    removeCards(s, player, value, count);
+  } else {
+    return fail('知らない行動です');
+  }
+
+  s.parried = null;
+  const deckOut = refill(s, player);
+  if (deckOut) events.push({ type: 'deckOut' });
+
+  if (action.type === 'attack') {
+    const defender = 1 - player;
+    const { value, count } = action;
+    if (countOf(s.hands[defender], value) < count) {
+      events.push({ type: 'hit', player });
+      s.turn = defender;
+      finishRound(s, player, 'hit', events);
+      s.lastEvents = events;
+      return { ok: true, state: s };
+    }
+    // パリィは自動。防御側は補充せずに次の手番を行う
+    removeCards(s, defender, value, count);
+    events.push({ type: 'parry', player: defender, value, count });
+    if (!deckOut) s.parried = defender;
+  }
+
+  if (deckOut) {
+    s.turn = 1 - player;
+    finishRound(s, judgeDeckOut(s.positions, s.hands), 'deck', events);
+  } else {
+    passTurn(s, player, events);
+  }
+  s.lastEvents = events;
+  return { ok: true, state: s };
 }
 
 export function viewFor(state, player) {
@@ -313,10 +223,11 @@ export function viewFor(state, player) {
     turn: state.turn,
     phase: state.phase,
     winner: state.winner,
-    myHand: [...state.hands[player]],
+    myHand: [...state.hands[player]].sort((a, b) => a - b),
     opponentHandCount: state.hands[1 - player].length,
     deckCount: state.deck.length,
     discardTop: state.discard.length ? state.discard[state.discard.length - 1] : null,
+    parried: state.parried,
     roundResult: state.roundResult,
     lastEvents: state.lastEvents,
     legal: legalActions(state, player),

@@ -1,169 +1,150 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>アンギャルド 対戦</title>
-  <link rel="stylesheet" href="/style.css" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>アン・ギャルド オンライン対戦</title>
+  <meta name="description" content="フェンシングをカードで遊ぶ2人用ゲーム「アン・ギャルド」を、ブラウザで友だちと対戦。">
+  <meta name="theme-color" content="#EFEBE4">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho+B1:wght@700;800&family=Zen+Kaku+Gothic+New:wght@500;700;900&display=swap">
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div id="app">
-    <!-- ===================== ロビー ===================== -->
-    <section id="lobby" class="screen lobby">
-      <div class="lobby-card">
-        <h1 class="title">
-          <span class="title-fr">En Garde</span>
-          <span class="title-jp">アンギャルド 対戦</span>
-        </h1>
-        <p class="tagline">剣士よ、間合いを制せ。2人用カードデュエル。</p>
+  <!-- ロビー: 映像のタイトル画面のような集中線の背景に、ロゴと2人の剣士 -->
+  <section id="screen-lobby" class="screen screen-title" hidden>
+    <div class="title-hero">
+      <h1 class="logo">EN GARDE</h1>
+      <p class="logo-sub">アン・ギャルド <em>オンライン対戦</em></p>
+      <div class="title-duel" id="title-duel"></div>
+    </div>
 
-        <label class="field">
-          <span class="field-label">名前</span>
-          <input id="name-input" type="text" maxlength="16" placeholder="プレイヤー" autocomplete="nickname" />
-        </label>
-
-        <button id="create-btn" class="btn btn-primary btn-block">部屋を作る</button>
-
-        <div class="divider"><span>または</span></div>
-
-        <label class="field">
-          <span class="field-label">部屋コード</span>
-          <input id="room-input" type="text" maxlength="5" placeholder="XXXXX" autocapitalize="characters" autocomplete="off" />
-        </label>
-        <button id="join-btn" class="btn btn-secondary btn-block">参加する</button>
-
-        <p id="lobby-error" class="error-text" hidden></p>
-        <button id="rules-btn-lobby" class="btn btn-ghost btn-block">遊び方（?）</button>
+    <div class="panel lobby-panel" id="lobby-create">
+      <label class="field">
+        <span class="field-label">あなたの名前</span>
+        <input id="name-input" type="text" maxlength="16" placeholder="例：アリス" autocomplete="nickname" enterkeyhint="done">
+      </label>
+      <button class="btn btn-primary btn-block" id="create-btn" type="button">部屋を作る</button>
+      <div class="or"><span>友だちの部屋に入る</span></div>
+      <div class="join-row">
+        <input id="room-input" type="text" maxlength="5" placeholder="部屋コード" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="部屋コード">
+        <button class="btn btn-secondary" id="join-btn" type="button">参加する</button>
       </div>
-    </section>
+      <p class="form-error" id="lobby-error" role="alert" hidden></p>
+    </div>
 
-    <!-- ===================== 待機 ===================== -->
-    <section id="waiting" class="screen waiting hidden">
-      <div class="lobby-card">
-        <h2 class="waiting-title">相手を待っています…</h2>
-        <div class="spinner" aria-hidden="true"></div>
-        <p class="waiting-room">部屋コード <strong id="waiting-code">-----</strong></p>
-        <label class="field">
-          <span class="field-label">招待URL</span>
-          <input id="invite-url" type="text" readonly />
-        </label>
-        <button id="copy-btn" class="btn btn-primary btn-block">URLをコピー</button>
-        <p id="copy-done" class="ok-text" hidden>コピーしました</p>
-        <p class="waiting-hint">相手が同じURLを開くと対戦が始まります。</p>
+    <div class="panel lobby-panel" id="lobby-invited" hidden>
+      <p class="invited-head">対戦に招待されました</p>
+      <p class="invited-code">部屋 <strong id="invited-code"></strong></p>
+      <label class="field">
+        <span class="field-label">あなたの名前</span>
+        <input id="invited-name" type="text" maxlength="16" placeholder="例：ボブ" autocomplete="nickname" enterkeyhint="go">
+      </label>
+      <button class="btn btn-primary btn-block" id="invited-join-btn" type="button">参加する</button>
+      <p class="form-error" id="invited-error" role="alert" hidden></p>
+      <button class="btn-link" id="invited-cancel" type="button">自分で部屋を作る</button>
+    </div>
+
+    <div class="lobby-foot">
+      <button class="btn-link" type="button" data-open-rules>ルールを見る</button>
+      <span>原作 ライナー・クニツィア ・ 非公式のファンメイド版</span>
+    </div>
+  </section>
+
+  <!-- 相手待ち -->
+  <section id="screen-wait" class="screen screen-title" hidden>
+    <div class="panel wait-panel">
+      <div class="wait-duel" id="wait-duel"></div>
+      <h2 class="wait-title">相手を待っています<span class="dots"><i>.</i><i>.</i><i>.</i></span></h2>
+      <p class="wait-code-label">部屋コード</p>
+      <p class="wait-code" id="wait-code">-----</p>
+      <div class="invite">
+        <input id="invite-url" type="text" readonly aria-label="招待URL">
+        <button class="btn btn-primary" id="copy-btn" type="button">URLをコピー</button>
       </div>
-    </section>
+      <button class="btn btn-secondary btn-block" id="share-btn" type="button" hidden>友だちに送る</button>
+      <p class="wait-hint">このURLを開いた人と対戦が始まります。</p>
+    </div>
+  </section>
 
-    <!-- ===================== 対戦 ===================== -->
-    <section id="game" class="screen game hidden">
-      <header class="topbar">
-        <div class="score-board">
-          <div class="player-tag p0" id="tag0">
-            <span class="dot"></span>
-            <span class="pname" id="name0">プレイヤー1</span>
-            <span class="pscore" id="score0">0</span><span class="pgoal">/5</span>
-          </div>
-          <div class="vs">VS</div>
-          <div class="player-tag p1" id="tag1">
-            <span class="pscore" id="score1">0</span><span class="pgoal">/5</span>
-            <span class="pname" id="name1">プレイヤー2</span>
-            <span class="dot"></span>
-          </div>
-        </div>
-        <div class="topbar-info">
-          <span class="chip" id="round-chip">第1ラウンド</span>
-          <span class="chip" id="distance-chip">間合い 22</span>
-          <span class="chip" id="deck-chip">山札 15</span>
-          <span class="chip" id="discard-chip">捨て札 –</span>
-          <button id="rules-btn" class="icon-btn" title="遊び方">?</button>
-        </div>
-      </header>
-
-      <div class="presence-banner hidden" id="presence-banner">相手の接続が切れました（再接続を待っています）</div>
-
-      <div class="table">
-        <div class="side opponent-side">
-          <div class="side-label"><span id="opp-label">相手の手札</span></div>
-          <div class="opp-hand" id="opp-hand"></div>
-        </div>
-
-        <div class="board-wrap">
-          <div class="board" id="board">
-            <div class="cells" id="cells"></div>
-            <div class="fencer f0" id="fencer0">
-              <svg viewBox="0 0 42 50" aria-hidden="true">
-                <circle cx="12" cy="8" r="5.5" fill="currentColor"/>
-                <rect x="6.5" y="14" width="11" height="17" rx="4" fill="currentColor"/>
-                <rect x="3" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
-                <rect x="15" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
-                <line x1="10" y1="20" x2="36" y2="3" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-                <circle cx="37.5" cy="2" r="2.5" fill="currentColor"/>
-              </svg>
-            </div>
-            <div class="fencer f1" id="fencer1">
-              <svg viewBox="0 0 42 50" aria-hidden="true">
-                <circle cx="12" cy="8" r="5.5" fill="currentColor"/>
-                <rect x="6.5" y="14" width="11" height="17" rx="4" fill="currentColor"/>
-                <rect x="3" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
-                <rect x="15" y="31" width="6" height="16" rx="2.5" fill="currentColor"/>
-                <line x1="10" y1="20" x2="36" y2="3" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-                <circle cx="37.5" cy="2" r="2.5" fill="currentColor"/>
-              </svg>
-            </div>
-            <div class="flash" id="flash"></div>
-          </div>
-          <div class="board-scale">
-            <span>1</span><span>12</span><span>23</span>
-          </div>
-        </div>
-
-        <div class="turn-banner" id="turn-banner">あなたの番</div>
-
-        <div class="side my-side">
-          <div class="side-label"><span>あなたの手札</span></div>
-          <div class="my-hand" id="my-hand"></div>
-        </div>
-
-        <div class="actions" id="actions">
-          <div class="action-hint" id="action-hint">カードを選んでください</div>
-          <div class="action-buttons">
-            <button id="move-forward" class="btn btn-move" disabled>前進 <i></i></button>
-            <button id="move-backward" class="btn btn-move" disabled>後退 <i></i></button>
-            <button id="attack-btn" class="btn btn-attack" disabled>攻撃</button>
-            <div class="count-stepper hidden" id="count-stepper">
-              <button id="count-minus" class="step-btn">−</button>
-              <span id="count-value">×1</span>
-              <button id="count-plus" class="step-btn">＋</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="log-wrap">
-          <div class="log-title">行動ログ</div>
-          <div class="log" id="log"></div>
-        </div>
+  <!-- 対戦 -->
+  <section id="screen-game" class="screen screen-game" hidden>
+    <header class="topbar">
+      <div class="brand" aria-hidden="true">
+        <span class="brand-mascot" id="brand-mascot"></span>
+        <span class="brand-text"><b>EN GARDE</b><small>オンライン対戦</small></span>
       </div>
-    </section>
+      <div class="scoreboard" id="scoreboard">
+        <div class="score-side p0"><span class="score-name" id="name-0"></span><span class="pips" id="pips-0"></span></div>
+        <span class="score-vs">VS</span>
+        <div class="score-side p1"><span class="pips" id="pips-1"></span><span class="score-name" id="name-1"></span></div>
+      </div>
+      <button class="icon-btn" type="button" data-open-rules aria-label="ルール">?</button>
+    </header>
 
-    <!-- ===================== モーダル ===================== -->
-    <div id="modal-root" class="modal-root hidden">
-      <div class="modal" id="modal">
-        <h2 id="modal-title"></h2>
-        <div id="modal-body"></div>
-        <div id="modal-actions" class="modal-actions"></div>
+    <p class="presence" id="presence" hidden></p>
+
+    <div class="headline">
+      <span class="round-badge" id="round-badge">1</span>
+      <div class="headline-text">
+        <h1 id="turn-title">準備中</h1>
+        <p id="turn-sub" aria-live="polite"></p>
       </div>
     </div>
 
-    <div id="replaced-overlay" class="replaced-overlay hidden">
-      <div class="replaced-card">
-        <h2>切断されました</h2>
-        <p>別のタブで開かれたため切断しました。</p>
-        <p class="replaced-sub">このタブからは対戦を操作できません。</p>
-        <button id="replaced-ok" class="btn btn-primary btn-block">ロビーへ戻る</button>
+    <div class="stage" id="stage">
+      <div class="piste" id="piste">
+        <div class="bracket" id="bracket"><span class="bracket-pill" id="bracket-pill">距離</span></div>
+        <div class="tiles" id="tiles"></div>
+        <div class="numbers" id="numbers"></div>
+        <div class="fx" id="fx"></div>
       </div>
     </div>
 
-    <div id="toast" class="toast hidden"></div>
+    <div class="table" id="table">
+      <div class="hand-zone" id="zone-0">
+        <div class="hand" id="hand-0"></div>
+        <span class="zone-label" id="label-0"></span>
+      </div>
+      <div class="piles">
+        <div class="pile">
+          <div class="card back pile-card" id="deck-card"><span class="deck-count" id="deck-count">15</span></div>
+          <span class="zone-label neutral">山札</span>
+        </div>
+        <div class="pile">
+          <div id="discard-card"></div>
+          <span class="zone-label neutral">捨て札</span>
+        </div>
+      </div>
+      <div class="hand-zone" id="zone-1">
+        <div class="hand" id="hand-1"></div>
+        <span class="zone-label" id="label-1"></span>
+      </div>
+    </div>
+
+    <div class="actions" id="actions">
+      <button class="btn btn-move" id="move-left" type="button" disabled></button>
+      <button class="btn btn-attack" id="attack-btn" type="button" disabled>攻撃</button>
+      <button class="btn btn-move" id="move-right" type="button" disabled></button>
+    </div>
+
+    <details class="log" id="log-box">
+      <summary>これまでの流れ</summary>
+      <ol id="log"></ol>
+    </details>
+  </section>
+
+  <div class="modal-root" id="modal-root" hidden>
+    <div class="modal panel" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title"></h2>
+      <div id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
   </div>
+
+  <div class="toast" id="toast" role="status" hidden></div>
 
   <script type="module" src="/app.js"></script>
 </body>

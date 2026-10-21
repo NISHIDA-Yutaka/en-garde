@@ -1,682 +1,1086 @@
-// En Garde クライアント
-const $ = (id) => document.getElementById(id);
-const CELL_COUNT = 23;
+// アンギャルド オンライン対戦のクライアント。
+// 勝敗はサーバーが決める。ここは届いた状態（view）を描き、lastEvents を演出として再生するだけ。
+import { createFencer, createFigure, setFace, mascotSvg } from './mascot.js';
 
-const state = {
+const $ = (id) => document.getElementById(id);
+const CELLS = 23;
+const CENTER_CELL = 12;
+const COLOR = ['オレンジ', 'ブルー'];
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const sleep = (ms) => new Promise((r) => setTimeout(r, reduceMotion ? Math.min(ms, 40) : ms));
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+const app = {
   ws: null,
   connected: false,
-  manualClose: false,
+  retry: 0,
   room: null,
   token: null,
-  player: null,
-  names: ['プレイヤー1', 'プレイヤー2'],
-  ready: [false, false],
-  presence: [true, true],
+  seat: null,
+  resuming: false,
+  pending: null, // 接続できたら送るメッセージ（作成・参加）
+  superseded: false,
+
   view: null,
-  selectedValue: null,
-  attackCount: 1,
-  processEvents: false,
+  names: ['', ''],
+  ready: [false, false],
+  peers: [true, true],
+  seq: -1,
+  selected: [], // 選んだ手札の位置（view.myHand の添え字）
+  busy: false, // 行動を送って結果を待っている
+  animating: false,
+  queue: Promise.resolve(),
   modalKey: null,
-  busy: false,
-  awaitingResume: false,
-  lastSeq: null,
-  replaced: false,
+  inviteRoom: new URLSearchParams(location.search).get('room')?.toUpperCase() || null,
 };
 
-// ------------------------------------------------------------ 永続化
-// token は sessionStorage（タブごと・リロードでは残る）。名前は localStorage。
-function saveIdentity() {
-  if (!state.room) return;
-  localStorage.setItem('engarde.name', $('name-input').value.trim().slice(0, 16));
-  sessionStorage.setItem('engarde.lastRoom', state.room);
-  if (state.token) sessionStorage.setItem(`engarde.token.${state.room}`, state.token);
-}
-function loadToken(room) { return sessionStorage.getItem(`engarde.token.${room}`); }
-function forgetIdentity(room) {
-  if (room) sessionStorage.removeItem(`engarde.token.${room}`);
-  sessionStorage.removeItem('engarde.lastRoom');
-}
+// ------------------------------------------------------------------ 保存
+// 席の情報はタブごと（sessionStorage）。同じブラウザの2つのタブで対戦できるように
+const store = {
+  get seat() {
+    try { return JSON.parse(sessionStorage.getItem('engarde:seat')); } catch { return null; }
+  },
+  set seat(v) {
+    try { v ? sessionStorage.setItem('engarde:seat', JSON.stringify(v)) : sessionStorage.removeItem('engarde:seat'); } catch { /* 保存できなくても遊べる */ }
+  },
+  get name() {
+    try { return localStorage.getItem('engarde:name') || ''; } catch { return ''; }
+  },
+  set name(v) {
+    try { localStorage.setItem('engarde:name', v); } catch { /* 同上 */ }
+  },
+};
 
-// ------------------------------------------------------------ 通信
-function send(obj) {
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
-}
+// ------------------------------------------------------------------ 通信
 
 function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
-  state.ws = ws;
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  app.ws = ws;
   ws.onopen = () => {
-    state.connected = true;
+    app.connected = true;
+    app.retry = 0;
     renderPresence();
-    if (state.room && state.token) {
-      state.awaitingResume = true;
-      send({ t: 'resume', room: state.room, token: state.token });
+    if (app.room && app.token) {
+      app.resuming = true;
+      send({ t: 'resume', room: app.room, token: app.token });
+    } else if (app.pending) {
+      send(app.pending);
+      app.pending = null;
     }
   };
-  ws.onmessage = (event) => {
+  ws.onmessage = (e) => {
     let msg;
-    try { msg = JSON.parse(event.data); } catch { return; }
-    handleMessage(msg);
+    try { msg = JSON.parse(e.data); } catch { return; }
+    onMessage(msg);
   };
-  ws.onclose = (event) => {
-    state.connected = false;
+  ws.onclose = (e) => {
+    app.connected = false;
+    if (app.ws !== ws) return;
+    if (e.code === 4001) {
+      app.superseded = true;
+      showSuperseded();
+      return;
+    }
     renderPresence();
-    if (state.replaced) return;
-    if (event && event.code === 4001) { handleSuperseded(); return; }
-    if (!state.manualClose) setTimeout(connect, 1500);
+    const wait = Math.min(1000 * 2 ** app.retry, 8000);
+    app.retry += 1;
+    setTimeout(connect, wait);
   };
-  ws.onerror = () => { /* close ハンドラで処理 */ };
 }
 
-// 別タブで同じ席に resume されたため切断された
-function handleSuperseded() {
-  state.replaced = true;
-  state.manualClose = true;
-  state.awaitingResume = false;
-  forgetIdentity(state.room);
-  state.room = null;
-  state.token = null;
-  $('replaced-overlay').classList.remove('hidden');
+function send(msg) {
+  if (app.ws && app.ws.readyState === WebSocket.OPEN) {
+    app.ws.send(JSON.stringify(msg));
+    return true;
+  }
+  return false;
 }
 
-function fillWaiting(room) {
-  $('waiting-code').textContent = room;
-  $('invite-url').value = `${location.origin}/?room=${room}`;
+function sendOrQueue(msg) {
+  if (!send(msg)) app.pending = msg;
 }
 
-function handleMessage(msg) {
+function onMessage(msg) {
   switch (msg.t) {
     case 'created':
-      state.room = msg.room; state.token = msg.token; state.player = 0;
-      saveIdentity();
-      fillWaiting(msg.room);
-      showScreen('waiting');
-      break;
     case 'joined':
-      state.awaitingResume = false;
-      state.room = msg.room; state.token = msg.token; state.player = msg.player;
-      saveIdentity();
-      if (!state.view) { fillWaiting(msg.room); showScreen('waiting'); }
+      app.room = msg.room;
+      app.token = msg.token;
+      app.seat = msg.player;
+      app.resuming = false;
+      store.seat = { room: msg.room, token: msg.token };
+      document.body.classList.toggle('me-blue', app.seat === 1);
       break;
-    case 'state': {
-      state.names = msg.names || state.names;
-      state.ready = msg.ready || [false, false];
-      const seq = typeof msg.seq === 'number' ? msg.seq : null;
-      const first = state.lastSeq === null;
-      state.processEvents = seq !== null && !first && seq > state.lastSeq;
-      state.lastSeq = seq;
-      applyState(msg.view);
+    case 'state':
+      app.queue = app.queue.then(() => onState(msg)).catch((err) => console.error(err));
       break;
-    }
     case 'presence':
-      state.presence = msg.connected;
+      app.peers = msg.connected;
       renderPresence();
       break;
     case 'error':
-      showToast(msg.message);
-      state.busy = false;
-      if (state.view) render(state.view);
-      if (state.awaitingResume) {
-        state.awaitingResume = false;
-        forgetIdentity(state.room);
-        state.room = null; state.token = null; state.view = null; state.lastSeq = null;
-        showScreen('lobby');
-      }
+      onError(msg.message);
       break;
     default:
-      break;
   }
 }
 
-// ------------------------------------------------------------ 画面切替
-function showScreen(name) {
-  for (const id of ['lobby', 'waiting', 'game']) $(id).classList.toggle('hidden', id !== name);
-}
-
-function applyState(view) {
-  state.view = view;
-  if (!view) {
-    state.processEvents = false;
-    if (!state.room) showScreen('lobby');
-    else { fillWaiting(state.room); showScreen('waiting'); }
+function onError(message) {
+  if (app.resuming) {
+    // 部屋が消えた・席がない。最初の画面に戻す
+    app.resuming = false;
+    app.room = null;
+    app.token = null;
+    store.seat = null;
+    showLobby();
+    toast(`${message}。最初の画面に戻りました`);
     return;
   }
-  state.busy = false;
-  if (view.phase === 'action') closeModal();
+  if (app.busy) {
+    app.busy = false;
+    render();
+  }
+  const lobbyVisible = !$('screen-lobby').hidden;
+  if (lobbyVisible) {
+    const box = $('lobby-invited').hidden ? $('lobby-error') : $('invited-error');
+    box.textContent = message;
+    box.hidden = false;
+  } else {
+    toast(message);
+  }
+}
+
+// ------------------------------------------------------------------ 状態の受け取り
+
+async function onState(msg) {
+  app.names = msg.names.map((n, i) => n ?? (i === 0 ? 'プレイヤー1' : 'プレイヤー2'));
+  app.ready = msg.ready;
+  const v = msg.view;
+
+  if (!v) {
+    showWait();
+    return;
+  }
+  const prev = app.view;
+  const fresh = msg.seq > app.seq;
+  if (!fresh && prev) {
+    // 準備完了の変化だけ
+    renderModalButtons();
+    return;
+  }
+  const consecutive = prev && msg.seq === app.seq + 1;
+  app.seq = msg.seq;
   showScreen('game');
-  render(view);
-}
 
-// ------------------------------------------------------------ 描画
-function pct(pos) { return `${((pos - 0.5) / CELL_COUNT) * 100}%`; }
+  const newMatch = !prev || (v.round === 1 && prev.round !== 1) || (v.round === 1 && prev.phase === 'matchOver');
+  const newRound = prev && v.round !== prev.round;
 
-function buildCells() {
-  const container = $('cells');
-  container.innerHTML = '';
-  for (let i = 1; i <= CELL_COUNT; i += 1) {
-    const cell = document.createElement('div');
-    cell.className = 'cell';
-    cell.style.left = `${((i - 1) / CELL_COUNT) * 100}%`;
-    if (i === 12) cell.classList.add('center-line');
-    if (i % 5 === 0 || i === 1 || i === 23) cell.textContent = String(i);
-    container.appendChild(cell);
+  if (newMatch) clearLog();
+  if (newRound || !prev) {
+    logSeparator(`第${v.round}ラウンド ・ 先手 ${nameOf(v.startPlayer)}`);
   }
-}
 
-function nameOf(player) { return state.names[player] || `プレイヤー${player + 1}`; }
-
-function render(view) {
-  $('name0').textContent = nameOf(0);
-  $('name1').textContent = nameOf(1);
-  $('score0').textContent = view.scores[0];
-  $('score1').textContent = view.scores[1];
-  $('round-chip').textContent = `第${view.round}ラウンド`;
-  const distance = Math.abs(view.positions[1] - view.positions[0]);
-  $('distance-chip').textContent = `間合い ${distance}`;
-  $('deck-chip').textContent = `山札 ${view.deckCount}`;
-  $('discard-chip').textContent = `捨て札 ${view.discardTop == null ? '–' : view.discardTop}`;
-
-  $('tag0').classList.toggle('active', view.turn === 0 && view.phase === 'action');
-  $('tag1').classList.toggle('active', view.turn === 1 && view.phase === 'action');
-
-  const events = view.lastEvents || [];
-  const isNew = state.processEvents;
-  state.processEvents = false;
-  const moveEvents = {};
-  if (isNew && events.length) {
-    for (const ev of events) {
-      if (ev.type === 'move') {
-        moveEvents[ev.player] = ev;
-        addLog(logForEvent(ev, view), ev.player);
-      } else {
-        addLog(logForEvent(ev, view), ev.player != null ? ev.player : 'system');
-      }
+  if (consecutive && !newRound && v.lastEvents.length) {
+    logEvents(v.lastEvents);
+    app.animating = true; // 演出の間は操作できない
+    app.selected = [];
+    render();
+    try {
+      await playEvents(prev, v);
+    } finally {
+      app.animating = false;
     }
-    state.selectedValue = null;
-    state.attackCount = 1;
-    triggerEffects(events);
   }
 
-  renderBoard(view, moveEvents);
-  renderHand(view);
-  renderActions(view);
-  renderTurn(view);
-  renderModal(view);
+  app.view = v;
+  app.busy = false;
+  app.selected = [];
+  render({ handFrom: prev?.round === v.round ? prev.myHand : null, scoresFrom: prev?.scores });
+
+  if (newRound || (newMatch && prev)) roundIntro(v);
+  if (v.phase === 'roundOver') showRoundModal(v);
+  else if (v.phase === 'matchOver') showMatchModal(v);
+  else if (app.modalKey && app.modalKey !== 'rules' && app.modalKey !== 'superseded') closeModal();
 }
 
-function logForEvent(ev, view) {
-  const who = (p) => (p === view.you ? 'あなた' : '相手');
-  switch (ev.type) {
-    case 'move': return `${who(ev.player)}が「${ev.card}」で${ev.dir === 'forward' ? '前進' : '後退'}（${ev.from}→${ev.to}）`;
-    case 'attack': return `${who(ev.player)}が「${ev.value}」×${ev.count} で攻撃！`;
-    case 'parry': return `${who(ev.player)}が「${ev.value}」×${ev.count} で受け流した`;
-    case 'hit': return `${who(ev.player)}の攻撃が命中！`;
-    case 'stuck': return `${who(ev.player)}は動けなくなった`;
-    case 'deckOut': return '山札が尽きた';
-    case 'roundEnd': return `ラウンド終了：${ev.winner == null ? '引き分け' : `${who(ev.winner)}の勝ち`}`;
-    case 'matchEnd': return `試合終了：${who(ev.winner)}の勝利！`;
-    default: return ev.type;
+// ------------------------------------------------------------------ 画面の切り替え
+
+function showScreen(name) {
+  for (const id of ['lobby', 'wait', 'game']) $(`screen-${id}`).hidden = id !== name;
+  renderPresence();
+}
+
+function showLobby() {
+  showScreen('lobby');
+  const invited = app.inviteRoom && /^[A-HJ-NP-Z2-9]{5}$/.test(app.inviteRoom);
+  $('lobby-invited').hidden = !invited;
+  $('lobby-create').hidden = !!invited;
+  if (invited) {
+    $('invited-code').textContent = app.inviteRoom;
+    $('invited-name').value = store.name;
+  } else {
+    $('name-input').value = store.name;
   }
 }
 
-function addLog(text, player) {
-  const log = $('log');
-  const entry = document.createElement('div');
-  const cls = player === 0 ? 'p0' : player === 1 ? 'p1' : 'system';
-  entry.className = `log-entry ${cls}`;
-  entry.textContent = text;
-  log.prepend(entry);
-  while (log.children.length > 40) log.removeChild(log.lastChild);
+function showWait() {
+  showScreen('wait');
+  $('wait-code').textContent = app.room || '-----';
+  $('invite-url').value = app.room ? `${location.origin}/?room=${app.room}` : '';
+  $('share-btn').hidden = !navigator.share;
 }
 
-function renderBoard(view, moveEvents) {
+// ------------------------------------------------------------------ 試合場の組み立て
+
+const fencers = [createFencer(0), createFencer(1)];
+const lane = document.createElement('div');
+
+function buildPiste() {
+  lane.className = 'lane';
+  $('piste').insertBefore(lane, $('tiles'));
+  lane.append(...fencers);
+  for (let c = 1; c <= CELLS; c += 1) {
+    const tile = document.createElement('button');
+    tile.type = 'button';
+    tile.className = `tile${c === CENTER_CELL ? ' center' : ''}`;
+    tile.dataset.cell = c;
+    tile.tabIndex = -1;
+    tile.setAttribute('aria-label', `${c}マス目`);
+    tile.addEventListener('click', () => onTile(c));
+    $('tiles').append(tile);
+    const num = document.createElement('span');
+    num.textContent = c;
+    if (c === CENTER_CELL) num.className = 'center';
+    $('numbers').append(num);
+  }
+  $('brand-mascot').innerHTML = mascotSvg();
+  $('brand-mascot').classList.add('p0');
+  $('title-duel').append(createFigure(0), createFigure(1));
+  const ghost = document.createElement('div');
+  ghost.className = 'ghost';
+  ghost.textContent = '?';
+  $('wait-duel').append(createFigure(0), ghost);
+}
+
+const cellPct = (cell) => `${((cell - 0.5) / CELLS) * 100}%`;
+const cellPx = () => $('tiles').clientWidth / CELLS;
+const tileEl = (cell) => $('tiles').children[cell - 1];
+
+function placeFencers(positions) {
+  fencers.forEach((f, p) => { f.style.left = cellPct(positions[p]); });
+  const [a, b] = positions;
+  const bracket = $('bracket');
+  bracket.style.left = cellPct(a);
+  bracket.style.width = `${((b - a) / CELLS) * 100}%`;
+  $('bracket-pill').textContent = `距離 ${b - a}`;
+}
+
+// ------------------------------------------------------------------ 描画
+
+const nameOf = (p) => app.names[p] || (p === 0 ? 'プレイヤー1' : 'プレイヤー2');
+const whoHtml = (p) => `<span class="who${p}">${escapeHtml(nameOf(p))}</span>`;
+const distanceOf = (v) => v.positions[1] - v.positions[0];
+
+function selection(v = app.view) {
+  if (!v || app.selected.length === 0) return null;
+  return { value: v.myHand[app.selected[0]], count: app.selected.length };
+}
+
+function render(opts = {}) {
+  const v = app.view;
+  if (!v) return;
+  renderStatic(v, opts);
+}
+
+function renderStatic(v, { handFrom = null, scoresFrom = null } = {}) {
+  const me = app.seat;
+  const myTurn = v.phase === 'action' && v.turn === me && !app.busy && !app.animating;
+  const screen = $('screen-game');
+  screen.classList.toggle('me-blue', me === 1);
+  screen.classList.toggle('their-turn', !myTurn);
+
+  // 点数
   for (const p of [0, 1]) {
-    const el = p === 0 ? $('fencer0') : $('fencer1');
-    if (moveEvents[p]) {
-      el.style.transition = 'none';
-      el.style.left = pct(moveEvents[p].from);
-      void el.offsetWidth;
-      el.style.transition = '';
-      el.style.left = pct(moveEvents[p].to);
-    } else {
-      el.style.transition = 'none';
-      el.style.left = pct(view.positions[p]);
-      void el.offsetWidth;
-      el.style.transition = '';
-    }
-    el.classList.toggle('thinking', view.phase === 'action' && view.turn === p);
-  }
-
-  const cells = [...$('cells').children];
-  for (const cell of cells) cell.classList.remove('target');
-
-  const my = view.you;
-  const val = state.selectedValue;
-  if (view.phase === 'action' && view.turn === my && val != null) {
-    const sign = my === 0 ? 1 : -1;
-    for (const a of view.legal) {
-      if (a.type !== 'move' || a.card !== val) continue;
-      const from = view.positions[my];
-      const to = from + (a.dir === 'forward' ? 1 : -1) * sign * val;
-      if (to >= 1 && to <= CELL_COUNT) cells[to - 1]?.classList.add('target');
+    $(`name-${p}`).innerHTML = `${escapeHtml(nameOf(p))}${p === me ? '<span class="you-tag">あなた</span>' : ''}`;
+    const pips = $(`pips-${p}`);
+    pips.innerHTML = '';
+    for (let i = 0; i < 5; i += 1) {
+      const pip = document.createElement('span');
+      pip.className = 'pip';
+      if (i < v.scores[p]) pip.classList.add('on');
+      if (scoresFrom && i >= scoresFrom[p] && i < v.scores[p]) pip.classList.add('new');
+      pips.append(pip);
     }
   }
+  $('round-badge').textContent = v.round;
+
+  if (!app.animating) renderHeadline(v, myTurn);
+
+  // 試合場
+  if (!app.animating) placeFencers(v.positions);
+  const d = distanceOf(v);
+  const canAttack = myTurn && v.legal.some((a) => a.type === 'attack');
+  $('bracket').classList.toggle('attackable', canAttack);
+  fencers.forEach((f, p) => {
+    f.classList.toggle('active', v.phase === 'action' && v.turn === p);
+    f.querySelector('.thinking')?.remove();
+    if (!app.animating && v.phase === 'action' && v.turn === p && p !== me) {
+      const t = document.createElement('div');
+      t.className = 'thinking';
+      t.innerHTML = '<i>.</i><i>.</i><i>.</i>';
+      f.append(t);
+    }
+    if (!app.animating && v.phase === 'action') {
+      f.classList.remove('hurt');
+      if (f.dataset.face !== 'blink') setFace(f, 'normal');
+    }
+  });
+
+  const sel = myTurn ? selection(v) : null;
+  for (const tile of $('tiles').children) {
+    tile.classList.remove('target');
+    delete tile.dataset.dir;
+    tile.tabIndex = -1;
+  }
+  if (sel && sel.count === 1) {
+    for (const a of v.legal) {
+      if (a.type !== 'move' || a.card !== sel.value) continue;
+      const to = moveTo(v, me, a.dir, a.card);
+      const tile = tileEl(to);
+      tile.classList.add('target');
+      tile.dataset.dir = a.dir === 'forward' ? '前進' : '後退';
+      tile.tabIndex = 0;
+    }
+  }
+
+  renderHands(v, myTurn, handFrom);
+
+  // 山札・捨て札
+  $('deck-count').textContent = v.deckCount;
+  $('deck-count').classList.toggle('low', v.deckCount > 0 && v.deckCount <= 3);
+  $('deck-card').style.visibility = v.deckCount > 0 ? 'visible' : 'hidden';
+  const discard = $('discard-card');
+  discard.innerHTML = '';
+  discard.append(v.discardTop ? cardFace(v.discardTop, 'div') : Object.assign(document.createElement('div'), { className: 'slot' }));
+
+  renderActions(v, myTurn, sel, d);
 }
 
-function renderHand(view) {
-  const mine = $('my-hand');
-  mine.innerHTML = '';
-  const isMyTurn = view.phase === 'action' && view.turn === view.you;
+function renderHeadline(v, myTurn) {
+  const me = app.seat;
+  const opp = 1 - me;
+  const title = $('turn-title');
+  const sub = $('turn-sub');
+  const d = distanceOf(v);
+  const hl = me === 1 ? 'hl-blue' : 'hl';
+
+  if (v.phase === 'roundOver') {
+    title.textContent = 'ラウンド終了';
+    sub.textContent = '';
+    return;
+  }
+  if (v.phase === 'matchOver') {
+    title.textContent = '試合終了';
+    sub.textContent = '';
+    return;
+  }
+  if (v.turn !== me) {
+    title.textContent = `${nameOf(opp)}の番`;
+    sub.innerHTML = v.parried === opp
+      ? `${whoHtml(opp)}が受け流して反撃の番です（補充はこの手番の終わり）`
+      : `相手が考えています… いまの距離は <span class="${hl}">${d}</span>`;
+    return;
+  }
+  title.textContent = 'あなたの番';
+  const sel = selection(v);
+  const attackCount = v.legal.filter((a) => a.type === 'attack').length; // 手持ちの距離ちょうどの札の枚数
+  const lead = v.parried === me ? `<span class="${hl}">受け流した！</span> 反撃のチャンス。` : '';
+  if (!sel) {
+    sub.innerHTML = attackCount
+      ? `${lead}距離 <span class="${hl}">${d}</span>。「${d}」のカードで<span class="${hl}">攻撃できます！</span>`
+      : `${lead}カードを選んでください。いまの距離は <span class="${hl}">${d}</span>`;
+    return;
+  }
+  if (sel.value === d) {
+    if (sel.count < attackCount) {
+      sub.innerHTML = `「${d}」×${sel.count}で攻撃できます。同じ「${d}」をもう1枚選ぶと<span class="${hl}">×${sel.count + 1}</span>に強くなります`;
+    } else if (sel.count > 1) {
+      sub.innerHTML = `<span class="${hl}">「${d}」×${sel.count}</span>で攻撃！ 相手は「${d}」を${sel.count}枚出さないと防げません`;
+    } else {
+      sub.innerHTML = `<span class="${hl}">「${d}」で攻撃</span>できます。光ったマスを押せば移動もできます`;
+    }
+    return;
+  }
+  const moves = v.legal.filter((a) => a.type === 'move' && a.card === sel.value);
+  sub.innerHTML = moves.length
+    ? `「${sel.value}」で <span class="${hl}">${sel.value}マス</span>動けます。光ったマスかボタンを押してください`
+    : `「${sel.value}」ではどこにも動けません`;
+}
+
+function moveTo(v, player, dir, card) {
+  const facing = player === 0 ? 1 : -1;
+  return v.positions[player] + (dir === 'forward' ? 1 : -1) * facing * card;
+}
+
+// 手札。どの札も「1枚の実物」として扱い、選んだ札だけを持ち上げる
+function renderHands(v, myTurn, handFrom) {
+  const me = app.seat;
+  const opp = 1 - me;
   const usable = new Set();
-  if (isMyTurn) {
-    for (const a of view.legal) {
-      if (a.type === 'move') usable.add(a.card);
-      else if (a.type === 'attack') usable.add(a.value);
-    }
-  }
-  for (const value of [...view.myHand].sort((a, b) => a - b)) {
-    const card = makeCard(value);
-    if (view.phase === 'action' && view.turn === view.you && usable.has(value)) {
-      if (state.selectedValue === value) card.classList.add('selected');
-      card.addEventListener('click', () => selectCard(value));
-    } else {
-      card.classList.add('disabled');
-    }
-    mine.appendChild(card);
-  }
-  if (view.myHand.length === 0) mine.appendChild(emptySlot());
+  for (const a of v.legal) usable.add(a.type === 'move' ? a.card : a.value);
 
-  const opp = $('opp-hand');
-  opp.innerHTML = '';
-  for (let i = 0; i < view.opponentHandCount; i += 1) opp.appendChild(backCard());
-  if (view.opponentHandCount === 0) opp.appendChild(emptySlot());
+  const mine = $(`hand-${me}`);
+  const theirs = $(`hand-${opp}`);
+  $(`zone-${me}`).className = 'hand-zone mine';
+  $(`zone-${opp}`).className = 'hand-zone opp';
+  mine.className = 'hand';
+  theirs.className = 'hand opp';
+  $(`label-${me}`).className = `zone-label p${me}`;
+  $(`label-${me}`).textContent = `${COLOR[me]}の手札（あなた）`;
+  $(`label-${opp}`).className = `zone-label p${opp}`;
+  $(`label-${opp}`).textContent = `${nameOf(opp)}の手札`;
+
+  // 新しく引いた札に印をつける
+  const fresh = new Array(v.myHand.length).fill(false);
+  if (handFrom) {
+    const left = [...handFrom];
+    v.myHand.forEach((c, i) => {
+      const k = left.indexOf(c);
+      if (k === -1) fresh[i] = true;
+      else left.splice(k, 1);
+    });
+  }
+
+  mine.innerHTML = '';
+  v.myHand.forEach((value, i) => {
+    const card = cardFace(value, 'button');
+    card.style.setProperty('--tilt', `${((i * 37) % 7 - 3) * 0.7}deg`);
+    const order = app.selected.indexOf(i);
+    if (order !== -1 && myTurn) {
+      card.classList.add('selected');
+      if (app.selected.length > 1) card.dataset.order = order + 1;
+    }
+    if (myTurn && !usable.has(value)) card.classList.add('dim');
+    if (fresh[i]) card.classList.add('arriving');
+    card.disabled = !myTurn || !usable.has(value);
+    card.setAttribute('aria-pressed', String(order !== -1));
+    card.setAttribute('aria-label', `「${value}」のカード`);
+    card.addEventListener('click', () => toggleCard(i));
+    mine.append(card);
+  });
+  if (!v.myHand.length) mine.append(Object.assign(document.createElement('div'), { className: 'slot' }));
+
+  theirs.innerHTML = '';
+  for (let i = 0; i < v.opponentHandCount; i += 1) {
+    const back = document.createElement('div');
+    back.className = 'card back';
+    back.style.setProperty('--tilt', `${((i * 53) % 5 - 2) * 1.2}deg`);
+    theirs.append(back);
+  }
+  if (!v.opponentHandCount) theirs.append(Object.assign(document.createElement('div'), { className: 'slot' }));
 }
 
-function makeCard(value) {
-  const card = document.createElement('div');
+function cardFace(value, tag = 'div') {
+  const card = document.createElement(tag);
+  if (tag === 'button') card.type = 'button';
   card.className = 'card';
-  card.innerHTML = `
-    <span class="suit">♠</span>
-    <span class="corner tl">${value}</span>
-    <span class="pips">${value}</span>
-    <span class="corner bl">${value}</span>`;
-  return card;
-}
-function backCard() {
-  const card = document.createElement('div');
-  card.className = 'card back';
-  return card;
-}
-function emptySlot() {
-  const card = document.createElement('div');
-  card.className = 'card empty-slot';
+  card.innerHTML = `<span class="corner tl">${value}</span><span class="num">${value}</span>`
+    + `<span class="dots-row">${'◆'.repeat(value)}</span><span class="corner br">${value}</span>`;
   return card;
 }
 
-function selectCard(value) {
-  if (state.busy) return;
-  if (state.selectedValue === value) {
-    state.selectedValue = null;
-  } else {
-    state.selectedValue = value;
-    state.attackCount = 1;
-  }
-  render(state.view);
+function miniCard(value, cls = '') {
+  return `<span class="mini ${cls}">${value}</span>`;
 }
 
-function renderActions(view) {
-  const isMyTurn = view.phase === 'action' && view.turn === view.you && !state.busy;
-  const val = state.selectedValue;
-  const fwd = $('move-forward');
-  const bwd = $('move-backward');
+function renderActions(v, myTurn, sel, d) {
+  const me = app.seat;
+  // 画面の左右どちらへ動くか。オレンジは右が前、ブルーは左が前
+  const leftDir = me === 0 ? 'backward' : 'forward';
+  const rightDir = me === 0 ? 'forward' : 'backward';
+  const label = { forward: '前進', backward: '後退' };
+  const can = (dir) => myTurn && sel && sel.count === 1
+    && v.legal.some((a) => a.type === 'move' && a.dir === dir && a.card === sel.value);
+
+  const left = $('move-left');
+  const right = $('move-right');
+  const steps = sel && sel.count === 1 ? `<span class="sub">${sel.value}マス</span>` : '';
+  left.innerHTML = `← ${label[leftDir]}${can(leftDir) ? steps : ''}`;
+  right.innerHTML = `${label[rightDir]} →${can(rightDir) ? steps : ''}`;
+  left.disabled = !can(leftDir);
+  right.disabled = !can(rightDir);
+  left.onclick = () => doMove(leftDir);
+  right.onclick = () => doMove(rightDir);
+
   const atk = $('attack-btn');
-  const stepper = $('count-stepper');
-
-  const legalMove = (dir) => isMyTurn && val != null && view.legal.some((a) => a.type === 'move' && a.dir === dir && a.card === val);
-  const forwardOk = legalMove('forward');
-  const backwardOk = legalMove('backward');
-  fwd.disabled = !forwardOk;
-  bwd.disabled = !backwardOk;
-
-  const distance = Math.abs(view.positions[1] - view.positions[0]);
-  const attacks = isMyTurn && val === distance ? view.legal.filter((a) => a.type === 'attack') : [];
-  const maxCount = attacks.length ? Math.max(...attacks.map((a) => a.count)) : 0;
-  atk.disabled = maxCount < 1;
-  if (maxCount > 1) {
-    stepper.classList.remove('hidden');
-    if (state.attackCount > maxCount) state.attackCount = maxCount;
-    if (state.attackCount < 1) state.attackCount = 1;
-    $('count-value').textContent = `×${state.attackCount}`;
-  } else {
-    stepper.classList.add('hidden');
-    state.attackCount = 1;
-  }
-
-  let hint;
-  if (view.phase === 'action' && view.turn !== view.you) hint = '相手の手番です…';
-  else if (view.phase !== 'action') hint = 'ラウンドは終了しました';
-  else if (state.busy) hint = '送信中…';
-  else if (val == null) hint = 'カードを選んでください';
-  else hint = `「${val}」を選択中 — 前進・後退、または攻撃`;
-  $('action-hint').textContent = hint;
-}
-
-function renderTurn(view) {
-  const banner = $('turn-banner');
-  banner.classList.remove('mine', 'theirs');
-  if (view.phase === 'matchOver') { banner.textContent = '試合終了'; return; }
-  if (view.phase === 'roundOver') { banner.textContent = 'ラウンド終了'; return; }
-  if (view.turn === view.you) { banner.textContent = 'あなたの番'; banner.classList.add('mine'); }
-  else { banner.textContent = '相手の番'; banner.classList.add('theirs'); }
+  const attackOk = myTurn && sel && sel.value === d
+    && v.legal.some((a) => a.type === 'attack' && a.count === sel.count);
+  atk.disabled = !attackOk;
+  atk.innerHTML = attackOk ? `⚔ 攻撃 ×${sel.count}<span class="sub">「${d}」を${sel.count}枚</span>` : '⚔ 攻撃';
 }
 
 function renderPresence() {
-  const banner = $('presence-banner');
-  const opp = state.player == null ? null : 1 - state.player;
-  const oppGone = opp != null && state.view && state.presence[opp] === false;
-  banner.classList.toggle('hidden', !oppGone && state.connected);
-  if (oppGone) banner.textContent = '相手の接続が切れました（再接続を待っています）';
-  else if (!state.connected) banner.textContent = 'サーバーに接続しています…';
+  const box = $('presence');
+  if ($('screen-game').hidden && $('screen-wait').hidden) {
+    box.hidden = true;
+    return;
+  }
+  if (!app.connected && !app.superseded) {
+    box.textContent = '接続が切れました。つなぎ直しています…';
+    box.hidden = false;
+  } else if (app.seat !== null && app.view && !app.peers[1 - app.seat]) {
+    box.textContent = '相手の接続が切れました（戻ってくるのを待っています）';
+    box.hidden = false;
+  } else {
+    box.hidden = true;
+  }
 }
 
-// ------------------------------------------------------------ 演出
-function triggerEffects(events) {
-  const board = $('board');
-  let boardClass = null;
-  let shake = false;
-  for (const ev of events) {
-    if (ev.type === 'attack') {
-      pulse($(`fencer${ev.player}`), 'attacking');
-      boardClass = boardClass || 'attack-flash';
-    } else if (ev.type === 'parry') {
-      pulse($(`fencer${ev.player}`), 'parrying');
-      boardClass = 'parry-flash';
-    } else if (ev.type === 'hit') {
-      pulse($(`fencer${1 - ev.player}`), 'hit');
-      boardClass = 'hit-flash';
-      shake = true;
+// ------------------------------------------------------------------ 操作
+
+function toggleCard(i) {
+  const v = app.view;
+  if (!v || app.busy || app.animating) return;
+  const value = v.myHand[i];
+  const at = app.selected.indexOf(i);
+  if (at !== -1) {
+    app.selected.splice(at, 1);
+  } else if (app.selected.length && v.myHand[app.selected[0]] === value && value === distanceOf(v)) {
+    app.selected.push(i); // 距離ちょうどの札は重ねて強い攻撃にできる
+  } else {
+    app.selected = [i];
+  }
+  render();
+}
+
+function doMove(dir) {
+  const v = app.view;
+  const sel = selection();
+  if (!v || !sel || sel.count !== 1 || app.busy || app.animating) return;
+  app.busy = true;
+  send({ t: 'action', action: { type: 'move', dir, card: sel.value } });
+  render();
+}
+
+function doAttack() {
+  const v = app.view;
+  const sel = selection();
+  if (!v || !sel || app.busy || app.animating) return;
+  app.busy = true;
+  send({ t: 'action', action: { type: 'attack', value: distanceOf(v), count: sel.count } });
+  render();
+}
+
+function onTile(cell) {
+  const v = app.view;
+  const sel = selection();
+  if (!v || !sel || sel.count !== 1) return;
+  for (const dir of ['forward', 'backward']) {
+    if (moveTo(v, app.seat, dir, sel.value) === cell && v.legal.some((a) => a.type === 'move' && a.dir === dir && a.card === sel.value)) {
+      doMove(dir);
+      return;
     }
   }
-  if (boardClass) {
-    board.classList.remove('attack-flash', 'parry-flash', 'hit-flash');
-    void board.offsetWidth;
-    board.classList.add(boardClass);
-    setTimeout(() => board.classList.remove(boardClass), 700);
+}
+
+// ------------------------------------------------------------------ 演出
+
+function fxAt(cell, html, cls, { bottom = null } = {}) {
+  const el = document.createElement('div');
+  el.className = `fx-item ${cls}`;
+  el.style.left = cellPct(cell);
+  if (bottom !== null) el.style.bottom = bottom;
+  el.innerHTML = html;
+  lane.append(el);
+  return el;
+}
+
+function removeLater(el, ms) {
+  setTimeout(() => el.remove(), reduceMotion ? 60 : ms);
+}
+
+function caption(player, cell, cardsHtml, pillHtml, pillCls) {
+  const el = fxAt(cell, `<div class="mini-cards">${cardsHtml}</div><span class="pill ${pillCls}">${pillHtml}</span>`, 'caption');
+  removeLater(el, 1500);
+}
+
+function spark(cell, offsetCells = 0) {
+  const rays = Array.from({ length: 10 }, (_, i) => `<i style="--a:${i * 36 + Math.random() * 14}deg"></i>`).join('');
+  const el = fxAt(cell + offsetCells, `${rays}<b></b>`, 'spark', { bottom: '55%' });
+  removeLater(el, 600);
+}
+
+// 剣士の背中側・頭の高さに出す（上に出る説明と重ならないように）
+function badge(player, cell, text, cls = '') {
+  const back = player === 0 ? -1.6 : 1.6;
+  const el = fxAt(Math.min(Math.max(cell + back, 2.2), CELLS - 1.2), text, `badge ${cls}`, { bottom: '40%' });
+  removeLater(el, 1600);
+}
+
+function shake() {
+  const stage = $('stage');
+  stage.classList.remove('shake');
+  void stage.offsetWidth;
+  stage.classList.add('shake');
+}
+
+async function hopTo(player, from, to) {
+  const f = fencers[player];
+  const hop = f.querySelector('.hop');
+  const step = to > from ? 1 : -1;
+  const per = 170;
+  const trail = [];
+  for (let c = from, k = 1; c !== to; c += step, k += 1) {
+    const next = c + step;
+    if (!reduceMotion) {
+      f.animate([{ left: cellPct(c) }, { left: cellPct(next) }], { duration: per, easing: 'ease-in-out' });
+      hop.animate([
+        { transform: 'translateY(0)' },
+        { transform: 'translateY(-26%)', offset: 0.45 },
+        { transform: 'translateY(0)' },
+      ], { duration: per, easing: 'ease-out' });
+    }
+    f.style.left = cellPct(next);
+    const tile = tileEl(next);
+    tile.classList.add('trail');
+    if (player === 1) tile.classList.add('b');
+    tile.innerHTML = `<span class="trail-no">${k}</span>`;
+    trail.push(tile);
+    await sleep(per);
   }
-  if (shake) {
-    board.classList.remove('shake');
-    void board.offsetWidth;
-    board.classList.add('shake');
-    setTimeout(() => board.classList.remove('shake'), 600);
+  setTimeout(() => {
+    for (const t of trail) {
+      t.classList.remove('trail', 'b');
+      t.innerHTML = '';
+    }
+  }, reduceMotion ? 50 : 700);
+}
+
+function lunge(player, distanceCells) {
+  const f = fencers[player];
+  const dir = player === 0 ? 1 : -1;
+  const px = Math.min(distanceCells * 0.35, 1.2) * cellPx() * dir;
+  f.classList.add('glint');
+  setTimeout(() => f.classList.remove('glint'), 700);
+  if (reduceMotion) return;
+  f.querySelector('.hop').animate([
+    { transform: 'translateX(0)' },
+    { transform: `translateX(${-px * 0.25}px)`, offset: 0.25 },
+    { transform: `translateX(${px}px)`, offset: 0.5 },
+    { transform: `translateX(${px}px)`, offset: 0.75 },
+    { transform: 'translateX(0)' },
+  ], { duration: 900, easing: 'ease-in-out' });
+}
+
+async function playEvents(prev, v) {
+  const pos = [...prev.positions];
+  placeFencers(pos);
+  fencers.forEach((f) => f.querySelector('.thinking')?.remove());
+
+  for (let i = 0; i < v.lastEvents.length; i += 1) {
+    const ev = v.lastEvents[i];
+    const nextEv = v.lastEvents[i + 1];
+    switch (ev.type) {
+      case 'move': {
+        const word = ev.dir === 'forward' ? '前進' : '後退';
+        const arrow = (ev.to > ev.from) ? '→' : '←';
+        caption(ev.player, ev.from, miniCard(ev.card), `${arrow} ${ev.card}マス${word}`, '');
+        await sleep(350);
+        await hopTo(ev.player, ev.from, ev.to);
+        pos[ev.player] = ev.to;
+        placeFencers(pos);
+        await sleep(200);
+        break;
+      }
+      case 'attack': {
+        const d = pos[1] - pos[0];
+        setFace(fencers[ev.player], 'angry');
+        caption(ev.player, pos[ev.player], miniCard(ev.value).repeat(ev.count), `⚔ 攻撃！ ${ev.value}×${ev.count}`, ev.player === 0 ? 'orange' : 'blue');
+        await sleep(450);
+        lunge(ev.player, d);
+        await sleep(430);
+        break;
+      }
+      case 'parry': {
+        const attacker = 1 - ev.player;
+        const mid = (pos[0] + pos[1]) / 2;
+        lunge(ev.player, 1.2);
+        spark(mid);
+        badge(ev.player, pos[ev.player], 'PARRY!', 'parry');
+        caption(ev.player, pos[ev.player], miniCard(ev.value).repeat(ev.count), `受け流し ${ev.value}×${ev.count}`, ev.player === 0 ? 'orange' : 'blue');
+        await sleep(900);
+        setFace(fencers[attacker], 'normal');
+        break;
+      }
+      case 'hit': {
+        const defender = 1 - ev.player;
+        const toward = defender === 0 ? 0.55 : -0.55;
+        spark(pos[defender], toward);
+        badge(defender, pos[defender], 'TOUCHÉ!');
+        setFace(fencers[defender], 'hurt');
+        fencers[defender].classList.add('hurt');
+        shake();
+        await sleep(1100);
+        break;
+      }
+      case 'deckOut': {
+        const el = fxAt(CENTER_CELL, '<span class="pill gold">山札が尽きた！</span>', 'caption');
+        removeLater(el, 1500);
+        if (nextEv?.type !== 'parry') await sleep(800);
+        break;
+      }
+      case 'stuck': {
+        setFace(fencers[ev.player], 'sad');
+        badge(ev.player, pos[ev.player], '動けない…', 'stuck');
+        await sleep(1100);
+        break;
+      }
+      case 'roundEnd': {
+        if (ev.winner !== null) {
+          setFace(fencers[ev.winner], 'happy');
+          if (ev.reason === 'deck') setFace(fencers[1 - ev.winner], 'sad');
+          confetti(ev.winner, 40);
+        }
+        await sleep(ev.reason === 'deck' ? 700 : 500);
+        break;
+      }
+      case 'matchEnd':
+        confetti(ev.winner, 120);
+        await sleep(400);
+        break;
+      default:
+    }
   }
 }
 
-function pulse(el, cls) {
-  if (!el) return;
-  el.classList.remove(cls);
-  void el.offsetWidth;
-  el.classList.add(cls);
-  setTimeout(() => el.classList.remove(cls), 650);
+function confetti(winner, n) {
+  if (reduceMotion) return;
+  const colors = winner === 0
+    ? ['#D9714E', '#F2B53A', '#E8906F', '#4F9A6A', '#5B93D0']
+    : ['#5B93D0', '#F2B53A', '#8DB6E2', '#4F9A6A', '#D9714E'];
+  const layer = document.createElement('div');
+  layer.className = 'confetti';
+  for (let i = 0; i < n; i += 1) {
+    const piece = document.createElement('i');
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.background = colors[i % colors.length];
+    piece.style.setProperty('--d', `${1.8 + Math.random() * 1.6}s`);
+    piece.style.setProperty('--delay', `${Math.random() * 0.5}s`);
+    piece.style.setProperty('--dx', `${(Math.random() - 0.5) * 160}px`);
+    piece.style.setProperty('--rot', `${(Math.random() - 0.5) * 1080}deg`);
+    if (i % 3 === 0) piece.style.borderRadius = '50%';
+    layer.append(piece);
+  }
+  document.body.append(layer);
+  setTimeout(() => layer.remove(), 4200);
 }
 
-// ------------------------------------------------------------ モーダル
-// 外部由来（相手が入力できる名前など）を innerHTML に入れる前にエスケープする
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ));
+function roundIntro(v) {
+  const el = fxAt(CENTER_CELL, `<span class="pill ${v.startPlayer === 0 ? 'orange' : 'blue'}">第${v.round}ラウンド ・ ${escapeHtml(nameOf(v.startPlayer))}から</span>`, 'caption');
+  removeLater(el, 1600);
 }
 
-function openModal(title, bodyHtml, actions) {
+// ------------------------------------------------------------------ 行動ログ
+
+function logLine(html, cls = '') {
+  const li = document.createElement('li');
+  li.innerHTML = html;
+  if (cls) li.className = cls;
+  $('log').prepend(li);
+  while ($('log').children.length > 120) $('log').lastElementChild.remove();
+}
+
+function logSeparator(text) {
+  logLine(escapeHtml(text), 'sep');
+}
+
+function clearLog() {
+  $('log').innerHTML = '';
+}
+
+function logEvents(events) {
+  for (const ev of events) {
+    switch (ev.type) {
+      case 'move': logLine(`${whoHtml(ev.player)}が「${ev.card}」で${ev.card}マス${ev.dir === 'forward' ? '前進' : '後退'}`); break;
+      case 'attack': logLine(`${whoHtml(ev.player)}が「${ev.value}」×${ev.count}で攻撃`); break;
+      case 'parry': logLine(`${whoHtml(ev.player)}が「${ev.value}」×${ev.count}で受け流した`); break;
+      case 'hit': logLine(`${whoHtml(ev.player)}の攻撃が命中！`); break;
+      case 'stuck': logLine(`${whoHtml(ev.player)}は動けなくなった`); break;
+      case 'deckOut': logLine('山札が尽きた'); break;
+      case 'roundEnd': logLine(ev.winner === null ? 'このラウンドは引き分け' : `${whoHtml(ev.winner)}がラウンドを取った`); break;
+      case 'matchEnd': logLine(`${whoHtml(ev.winner)}の勝利！`); break;
+      default:
+    }
+  }
+}
+
+// ------------------------------------------------------------------ モーダル
+
+function openModal(key, title, bodyHtml, actions) {
+  app.modalKey = key;
   $('modal-title').textContent = title;
   $('modal-body').innerHTML = bodyHtml;
   const box = $('modal-actions');
   box.innerHTML = '';
-  for (const action of actions) {
-    const btn = document.createElement('button');
-    btn.className = `btn ${action.cls || 'btn-secondary'}`;
-    btn.textContent = action.label;
-    btn.disabled = !!action.disabled;
-    btn.addEventListener('click', action.onClick);
-    box.appendChild(btn);
+  for (const a of actions) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = `btn ${a.cls || 'btn-primary'} btn-block`;
+    b.textContent = a.label;
+    if (a.id) b.id = a.id;
+    b.addEventListener('click', a.onClick);
+    box.append(b);
   }
-  $('modal-root').classList.remove('hidden');
-}
-function closeModal() { $('modal-root').classList.add('hidden'); }
-
-function roundOutcomeText(r, view) {
-  if (r.winner == null) return '引き分け';
-  return `${escapeHtml(nameOf(r.winner))} の勝ち`;
+  $('modal-root').hidden = false;
+  box.querySelector('button')?.focus({ preventScroll: true });
 }
 
-function reasonText(r, view) {
-  if (r.reason === 'hit') {
-    const attacker = escapeHtml(nameOf(r.winner));
-    return r.winner === view.you ? 'あなたの攻撃が命中しました。' : `${attacker}の攻撃が命中しました。`;
-  }
-  if (r.reason === 'stuck') {
-    const stuckPlayer = r.winner == null ? null : 1 - r.winner;
-    return stuckPlayer === view.you
-      ? 'あなたは動くことも攻撃することもできず、このラウンドは負けました。'
-      : '相手は動くことも攻撃することもできず、このラウンドは負けました。';
-  }
-  if (r.reason === 'deck') return '山札が尽きたため、公開手札による判定を行いました。';
-  return '';
+function closeModal() {
+  app.modalKey = null;
+  $('modal-root').hidden = true;
 }
 
-function deckJudgeHtml(r, view) {
-  if (r.reason !== 'deck' || !r.revealedHands) return '';
-  const distance = Math.abs(view.positions[1] - view.positions[0]);
-  const advance = [view.positions[0] - 1, 23 - view.positions[1]];
-  let html = `<p class="modal-body-text">判定に使った間合い：<strong>${distance}</strong></p>`;
-  html += '<div class="deck-judge">';
+function scoreRow(scores) {
+  const side = (p) => `<div class="score-side p${p}"><span class="pips">${
+    Array.from({ length: 5 }, (_, i) => `<span class="pip${i < scores[p] ? ' on' : ''}"></span>`).join('')
+  }</span></div>`;
+  return `<div class="result-score">${side(0)}<span class="score-vs">${scores[0]} – ${scores[1]}</span>${side(1)}</div>`;
+}
+
+function resultDuel(winner) {
+  return `<div class="result-duel" data-winner="${winner ?? ''}"></div>`;
+}
+
+function fillDuel(winner, loserFace) {
+  const box = $('modal-body').querySelector('.result-duel');
+  if (!box) return;
   for (const p of [0, 1]) {
-    const count = r.revealedHands[p].filter((c) => c === distance).length;
-    const me = p === view.you ? 'あなた' : '相手';
-    html += `<div class="deck-judge-row"><span class="dj-name">${escapeHtml(nameOf(p))}（${me}）</span>`
-      + `<span class="dj-count">間合いのカード ×${count}</span>`
-      + `<span class="dj-advance">前進 ${advance[p]}</span></div>`;
+    const face = winner === null ? 'normal' : p === winner ? 'happy' : loserFace;
+    const fig = createFigure(p, face);
+    if (winner !== null) fig.classList.add(p === winner ? 'winner' : 'loser');
+    box.append(fig);
   }
-  html += '</div>';
-  html += '<p class="modal-body-text">間合いのカードが多い方の勝ち。同数なら前進している方の勝ちです。</p>';
-  html += '<div class="reveal-row">';
-  for (const p of [0, 1]) {
-    html += `<div class="reveal-hand"><div class="reveal-name">${escapeHtml(nameOf(p))}</div>`;
-    for (const c of [...r.revealedHands[p]].sort((a, b) => a - b)) html += `<span class="mini-card">${c}</span>`;
-    html += '</div>';
-  }
-  html += '</div>';
-  return html;
 }
 
-function showRoundModal(view) {
-  const r = view.roundResult || {};
-  let body = `<div class="round-result-banner">${roundOutcomeText(r, view)}</div>`;
-  body += `<p class="modal-body-text">${reasonText(r, view)}</p>`;
-  body += deckJudgeHtml(r, view);
-  body += `<p class="modal-body-text">スコア ${view.scores[0]} – ${view.scores[1]}</p>`;
-  openModal('ラウンド終了', body, [{
-    label: '次のラウンドへ', cls: 'btn-primary',
-    onClick: () => { state.busy = true; send({ t: 'next' }); renderRoundModalReady(view); },
+function reasonText(r) {
+  if (r.reason === 'hit') return `${whoHtml(r.winner)}の攻撃が命中しました。`;
+  if (r.reason === 'stuck') return `${whoHtml(1 - r.winner)}が動けなくなりました。`;
+  return '山札が尽きたので、手札で判定しました。';
+}
+
+// 山札切れの判定の中身: 距離ちょうどの札の枚数 → 前進した距離
+function judgeHtml(v) {
+  const r = v.roundResult;
+  if (!r || r.reason !== 'deck' || !r.revealedHands) return '';
+  const d = distanceOf(v);
+  const counts = r.revealedHands.map((h) => h.filter((c) => c === d).length);
+  const advance = [v.positions[0] - 1, CELLS - v.positions[1]];
+  const row = (p) => `<div class="judge-row">
+      <span class="judge-name p${p}">${escapeHtml(nameOf(p))}${p === app.seat ? '（あなた）' : ''}</span>
+      <span class="judge-count">「${d}」×${counts[p]} ・ ${advance[p]}マス前進</span>
+      <div class="judge-cards">${[...r.revealedHands[p]].sort((a, b) => a - b).map((c) => miniCard(c, c === d ? `match${p === 1 ? ' b' : ''}` : '')).join('')}</div>
+    </div>`;
+  const op = (a, b) => (a > b ? '&gt;' : a < b ? '&lt;' : '=');
+  const byCount = counts[0] !== counts[1];
+  const compare = byCount
+    ? `「${d}」の枚数 ${counts[0]}<span class="op">${op(counts[0], counts[1])}</span>${counts[1]}`
+    : `枚数は同じ → 前進 ${advance[0]}<span class="op">${op(advance[0], advance[1])}</span>${advance[1]}`;
+  return `<div class="judge">
+      <div class="judge-title">いまの距離は ${d}。手札の「${d}」が多い方の勝ち</div>
+      ${row(0)}
+      <div class="judge-vs">${compare}</div>
+      ${row(1)}
+      <p class="judge-note">同じ枚数なら、スタートから多く前進した方の勝ち</p>
+    </div>`;
+}
+
+function showRoundModal(v) {
+  const key = `round-${app.seq}`;
+  if (app.modalKey === key) {
+    renderModalButtons();
+    return;
+  }
+  const r = v.roundResult;
+  const winner = r.winner;
+  const pill = winner === null
+    ? '<span class="result-pill">引き分け</span>'
+    : `<span class="result-pill p${winner}">${winner === app.seat ? 'あなた' : escapeHtml(nameOf(winner))}の勝ち！</span>`;
+  const body = `${pill}${resultDuel(winner)}<p class="result-reason">${reasonText(r)}</p>${judgeHtml(v)}${scoreRow(v.scores)}<p class="ready-note" id="ready-note"></p>`;
+  openModal(key, `第${v.round}ラウンドの結果`, body, [{
+    id: 'next-btn',
+    label: '次のラウンドへ',
+    onClick: () => {
+      send({ t: 'next' });
+      app.ready[app.seat] = true;
+      renderModalButtons();
+    },
   }]);
-  renderRoundModalReady(view);
+  fillDuel(winner, r.reason === 'hit' ? 'hurt' : 'sad');
+  renderModalButtons();
 }
 
-function renderRoundModalReady(view) {
-  const btn = $('modal-actions').querySelector('button');
-  if (!btn) return;
-  const iReady = state.ready[view.you];
-  const oppReady = state.ready[1 - view.you];
-  if (iReady && !oppReady) { btn.disabled = true; btn.textContent = '相手の返答を待っています…'; }
-  else if (iReady && oppReady) { btn.disabled = true; btn.textContent = '開始します…'; }
-  else { btn.disabled = false; btn.textContent = '次のラウンドへ'; }
-}
-
-function showMatchModal(view) {
-  const winnerName = escapeHtml(nameOf(view.winner));
-  const body = `
-    <p class="modal-body-text" style="text-align:center;font-size:1.15rem">
-      🏆 <strong>${winnerName}</strong> の勝利！
-    </p>
-    <p class="modal-body-text" style="text-align:center">最終スコア ${view.scores[0]} – ${view.scores[1]}</p>`;
-  openModal('試合終了', body, [{
-    label: 'もう一度対戦', cls: 'btn-primary',
-    onClick: () => { state.busy = true; send({ t: 'rematch' }); renderMatchModalReady(view); },
-  }]);
-  renderMatchModalReady(view);
-}
-
-function renderMatchModalReady(view) {
-  const btn = $('modal-actions').querySelector('button');
-  if (!btn) return;
-  if (state.ready[view.you] && !state.ready[1 - view.you]) { btn.disabled = true; btn.textContent = '相手の返答を待っています…'; }
-  else { btn.disabled = false; btn.textContent = 'もう一度対戦'; }
-}
-
-function renderModal(view) {
-  if (view.phase === 'roundOver') {
-    const key = `ro-${view.round}-${view.roundResult?.reason}-${view.roundResult?.winner}`;
-    if (state.modalKey !== key) { state.modalKey = key; showRoundModal(view); }
-    else renderRoundModalReady(view);
-  } else if (view.phase === 'matchOver') {
-    const key = `mo-${view.winner}-${view.scores.join('-')}`;
-    if (state.modalKey !== key) { state.modalKey = key; showMatchModal(view); }
-    else renderMatchModalReady(view);
-  } else if (state.modalKey) {
-    state.modalKey = null;
-    closeModal();
+function showMatchModal(v) {
+  const key = `match-${app.seq}`;
+  if (app.modalKey === key) {
+    renderModalButtons();
+    return;
   }
+  const w = v.winner;
+  const pill = `<span class="result-pill p${w}">${w === app.seat ? 'あなた' : escapeHtml(nameOf(w))}の勝利！</span>`;
+  const last = v.roundResult ? `<p class="result-reason">最後のラウンド：${reasonText(v.roundResult)}</p>${judgeHtml(v)}` : '';
+  openModal(key, '試合終了', `${pill}${resultDuel(w)}${scoreRow(v.scores)}${last}<p class="ready-note" id="ready-note"></p>`, [{
+    id: 'next-btn',
+    label: 'もう一度対戦',
+    onClick: () => {
+      send({ t: 'rematch' });
+      app.ready[app.seat] = true;
+      renderModalButtons();
+    },
+  }]);
+  fillDuel(w, 'sad');
+  renderModalButtons();
+}
+
+function renderModalButtons() {
+  const btn = $('next-btn');
+  const note = $('ready-note');
+  if (!btn || !app.view || app.seat === null) return;
+  const mine = app.ready[app.seat];
+  const theirs = app.ready[1 - app.seat];
+  const rematch = app.view.phase === 'matchOver';
+  btn.disabled = mine;
+  btn.textContent = mine ? '相手を待っています…' : rematch ? 'もう一度対戦' : '次のラウンドへ';
+  note.textContent = theirs && !mine ? `${nameOf(1 - app.seat)}は準備できています` : '';
 }
 
 function showRules() {
-  const body = `
-    <p class="modal-body-text">ライナー・クニツィア「En Garde」の基本ルール。</p>
-    <ul class="rules-list">
-      <li>盤は1〜23の23マス。相手との間合いを読み合います。</li>
-      <li>手番では <strong>移動</strong> か <strong>攻撃</strong> のどちらか1つ。</li>
-      <li><strong>移動</strong>：カードを1枚出し、その数だけ前進／後退。盤外・相手と重なる・飛び越す移動は不可。手札は5枚まで補充。</li>
-      <li><strong>攻撃</strong>：間合いと<strong>ちょうど同じ数字</strong>のカードを1枚以上出す。同じ数字を多く出せば強化攻撃。</li>
-      <li><strong>パリィ</strong>：同じ数字を同じ枚数出せば防げる。防げるなら自動で防御。合計値が同じでも数字が違えば防げません。</li>
-      <li>防いだ側は補充せずにそのまま自分の手番を行います。</li>
-      <li>動くことも攻撃もできないと、そのラウンドは負け。</li>
-      <li><strong>山札切れ</strong>：最後の1枚が引かれたらその手番でラウンド終了。間合いのカードを多く持つ方が勝ち、同数ならより前進した方の勝ち、それも同じなら引き分け。</li>
-      <li>5ラウンド先取で試合の勝ち。ラウンドごとに先手が交代します。</li>
-    </ul>`;
-  openModal('遊び方', body, [{ label: '閉じる', cls: 'btn-ghost', onClick: () => closeModal() }]);
+  const prevKey = app.modalKey;
+  const body = `<div class="rules-grid">
+      <div class="rule-card"><h3><i>🏆</i>目的</h3><p>攻撃を当てると1ポイント。先に<b>5ポイント</b>取った人の勝ち。</p></div>
+      <div class="rule-card"><h3><i>🃏</i>準備</h3><p>23マスの両はしから。カードは1〜5が5枚ずつ。手札は<b>5枚</b>で、先手はラウンドごとに交代。</p></div>
+      <div class="rule-card"><h3><i>⇄</i>移動</h3><p>カード1枚の数だけ<b>ちょうど</b>前進か後退。相手と同じマス・追い越し・コースの外はダメ。</p></div>
+      <div class="rule-card"><h3><i>⚔</i>攻撃</h3><p>相手との距離と<b>同じ数字</b>のカードで攻撃。同じ数字を何枚重ねてもよく、多いほど強い。</p></div>
+      <div class="rule-card"><h3><i>🛡</i>防御</h3><p><b>同じ数字を同じ枚数</b>持っていれば自動で受け流し（パリー）。受け流した人は補充せずに反撃の番。</p></div>
+      <div class="rule-card"><h3><i>⚑</i>終了</h3><p>命中／動けなくなる／山札切れ。山札切れなら、距離と同じ数字を<b>多く持つ人</b>、同じなら多く前進した人の勝ち。</p></div>
+    </div>
+    <p class="rules-howto">遊び方：カードを押すと、そのカードで行けるマスが光ります。光ったマスかボタンで移動。距離と同じ数字のカードは、同じ数字をもう1枚押すと ×2 の強い攻撃になります。</p>`;
+  const returnTo = prevKey && prevKey !== 'rules' ? prevKey : null;
+  openModal('rules', 'ルール（基本ルール）', body, [{
+    label: '閉じる',
+    cls: 'btn-secondary',
+    onClick: () => {
+      closeModal();
+      if (returnTo && app.view) {
+        if (app.view.phase === 'roundOver') showRoundModal(app.view);
+        else if (app.view.phase === 'matchOver') showMatchModal(app.view);
+      }
+    },
+  }]);
 }
 
-// ------------------------------------------------------------ トースト
+function showSuperseded() {
+  openModal('superseded', 'ほかのタブで開かれました', '<p class="result-reason">この対戦は、別のタブ（または別の画面）で開かれたため、こちらは止めました。</p>', [{
+    label: 'このタブで続ける',
+    onClick: () => {
+      closeModal();
+      app.superseded = false;
+      app.seq = -1;
+      app.view = null;
+      connect();
+    },
+  }]);
+}
+
 let toastTimer = null;
-function showToast(text) {
-  const toast = $('toast');
-  toast.textContent = text;
-  toast.classList.remove('hidden');
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.add('hidden'), 2600);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
 }
 
-// ------------------------------------------------------------ 操作
-function wireActions() {
-  $('move-forward').addEventListener('click', () => submitMove('forward'));
-  $('move-backward').addEventListener('click', () => submitMove('backward'));
-  $('attack-btn').addEventListener('click', submitAttack);
-  $('count-minus').addEventListener('click', () => {
-    state.attackCount = Math.max(1, state.attackCount - 1); render(state.view);
+// ------------------------------------------------------------------ ロビー
+
+function readName(input) {
+  const name = input.value.trim().slice(0, 16);
+  store.name = name;
+  return name;
+}
+
+function createRoom() {
+  $('lobby-error').hidden = true;
+  sendOrQueue({ t: 'create', name: readName($('name-input')) });
+}
+
+function joinRoom(code, nameInput, errorBox) {
+  const room = code.trim().toUpperCase();
+  errorBox.hidden = true;
+  if (!/^[A-HJ-NP-Z2-9]{5}$/.test(room)) {
+    errorBox.textContent = '部屋コードは5文字です（例：K7QX3）';
+    errorBox.hidden = false;
+    return;
+  }
+  sendOrQueue({ t: 'join', room, name: readName(nameInput) });
+}
+
+async function copyInvite() {
+  const url = $('invite-url').value;
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    $('invite-url').select();
+    document.execCommand('copy');
+  }
+  const btn = $('copy-btn');
+  btn.textContent = 'コピーしました';
+  setTimeout(() => { btn.textContent = 'URLをコピー'; }, 1800);
+}
+
+function wire() {
+  $('create-btn').addEventListener('click', createRoom);
+  $('name-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') createRoom(); });
+  $('join-btn').addEventListener('click', () => joinRoom($('room-input').value, $('name-input'), $('lobby-error')));
+  $('room-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('join-btn').click(); });
+  $('invited-join-btn').addEventListener('click', () => joinRoom(app.inviteRoom, $('invited-name'), $('invited-error')));
+  $('invited-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('invited-join-btn').click(); });
+  $('invited-cancel').addEventListener('click', () => {
+    app.inviteRoom = null;
+    history.replaceState(null, '', '/');
+    showLobby();
   });
-  $('count-plus').addEventListener('click', () => {
-    const distance = Math.abs(state.view.positions[1] - state.view.positions[0]);
-    const max = Math.max(...state.view.legal.filter((a) => a.type === 'attack' && a.value === distance).map((a) => a.count), 1);
-    state.attackCount = Math.min(max, state.attackCount + 1); render(state.view);
+  $('copy-btn').addEventListener('click', copyInvite);
+  $('share-btn').addEventListener('click', () => {
+    navigator.share?.({ title: 'アン・ギャルドで対戦しよう', url: $('invite-url').value }).catch(() => {});
   });
-  $('rules-btn').addEventListener('click', showRules);
-  $('rules-btn-lobby').addEventListener('click', showRules);
-  $('create-btn').addEventListener('click', () => {
-    saveIdentity();
-    send({ t: 'create', name: $('name-input').value });
-  });
-  $('join-btn').addEventListener('click', () => {
-    const room = $('room-input').value.trim().toUpperCase();
-    if (room.length !== 5) { $('lobby-error').textContent = '部屋コードは5文字です'; $('lobby-error').hidden = false; return; }
-    $('lobby-error').hidden = true;
-    saveIdentity();
-    state.room = room;
-    send({ t: 'join', room, name: $('name-input').value });
-  });
-  $('replaced-ok').addEventListener('click', () => {
-    $('replaced-overlay').classList.add('hidden');
-    state.replaced = false;
-    state.manualClose = false;
-    state.view = null;
-    state.lastSeq = null;
-    state.room = null;
-    state.token = null;
-    showScreen('lobby');
-    connect();
-  });
-  $('copy-btn').addEventListener('click', async () => {
-    const url = $('invite-url').value;
-    try { await navigator.clipboard.writeText(url); }
-    catch {
-      $('invite-url').select(); document.execCommand('copy');
+  $('attack-btn').addEventListener('click', doAttack);
+  for (const b of document.querySelectorAll('[data-open-rules]')) b.addEventListener('click', showRules);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (app.modalKey === 'rules') $('modal-actions').querySelector('button')?.click();
+      else if (app.selected.length) {
+        app.selected = [];
+        render();
+      }
     }
-    $('copy-done').hidden = false;
-    setTimeout(() => { $('copy-done').hidden = true; }, 1800);
   });
+  window.addEventListener('resize', () => { if (app.view && !app.animating) placeFencers(app.view.positions); });
 }
 
-function submitMove(dir) {
-  const view = state.view;
-  if (!view || state.busy || state.selectedValue == null) return;
-  state.busy = true;
-  render(view);
-  send({ t: 'action', action: { type: 'move', dir, card: state.selectedValue } });
-}
-function submitAttack() {
-  const view = state.view;
-  if (!view || state.busy || state.selectedValue == null) return;
-  const distance = Math.abs(view.positions[1] - view.positions[0]);
-  state.busy = true;
-  render(view);
-  send({ t: 'action', action: { type: 'attack', value: distance, count: state.attackCount } });
-}
+// ------------------------------------------------------------------ 起動
 
-// ------------------------------------------------------------ 起動
 function init() {
-  buildCells();
-  wireActions();
-  $('name-input').value = localStorage.getItem('engarde.name') || '';
-
-  const params = new URLSearchParams(location.search);
-  const roomParam = (params.get('room') || '').toUpperCase();
-  if (roomParam) $('room-input').value = roomParam;
-
-  const lastRoom = sessionStorage.getItem('engarde.lastRoom');
-
-  connect();
-
-  // 自動復帰
-  const resumeRoom = roomParam || lastRoom;
-  if (resumeRoom) {
-    const token = loadToken(resumeRoom);
-    if (token) {
-      state.room = resumeRoom;
-      state.token = token;
-      state.awaitingResume = true;
-      // connect() の onopen で resume を送る
-    } else if (roomParam) {
-      // 招待URLを開いただけ（まだ席がない）
-      showScreen('lobby');
-    }
+  buildPiste();
+  wire();
+  const saved = store.seat;
+  // 招待URLで別の部屋を開いたときは、前の席には戻らない
+  if (saved && (!app.inviteRoom || app.inviteRoom === saved.room)) {
+    app.room = saved.room;
+    app.token = saved.token;
   } else {
-    showScreen('lobby');
+    showLobby();
   }
-
-  // サーバー未接続でも復帰を試みるため、open を待つ
-  if (state.ws.readyState === WebSocket.OPEN && state.room && state.token) {
-    state.awaitingResume = true;
-    send({ t: 'resume', room: state.room, token: state.token });
-  }
+  connect();
 }
 
 init();
