@@ -795,10 +795,7 @@ function celebrate(winner, scores) {
     document.body.append(layer);
 
     const timers = [];
-    if (!reduceMotion) {
-      timers.push(setTimeout(() => confettiCannons(winner), 250));
-      timers.push(setTimeout(() => confettiCannons(winner), 1150));
-    }
+    if (!reduceMotion) timers.push(setTimeout(() => confettiCannons(winner), 250));
     let done = false;
     const finish = () => {
       if (done) return;
