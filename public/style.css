@@ -600,10 +600,69 @@ button.card.selected:hover { transform: rotate(var(--tilt, 0deg)) translateY(-14
 
 /* 紙吹雪 */
 .confetti { position: fixed; inset: 0; pointer-events: none; z-index: 70; overflow: hidden; }
-.confetti i {
+.confetti > i {
   position: absolute; top: -20px; width: 8px; height: 13px; border-radius: 2px;
   animation: fall var(--d, 2.4s) cubic-bezier(.25,.6,.4,1) var(--delay, 0s) both;
 }
+
+/* 下から打ち上げる紙吹雪（試合の勝利演出） */
+.confetti .piece { position: absolute; top: 100%; width: 0; height: 0; }
+.confetti .piece i {
+  display: block; width: 9px; height: 12px; margin: -6px 0 0 -4px; border-radius: 2px;
+  animation: flutter var(--flip, 0.8s) linear infinite;
+}
+.cannon-flash {
+  position: absolute; bottom: -70px; width: 220px; height: 220px; margin-left: -110px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 246, 220, 0.95) 0 16%, rgba(242, 181, 58, 0.55) 34%, transparent 66%);
+  transform: rotate(var(--lean, 0deg));
+  animation: cannon 0.5s ease-out both;
+}
+
+/* 試合の勝利演出 */
+.victory {
+  position: fixed; inset: 0; z-index: 55; display: grid; place-items: center; padding: 16px;
+  background: rgba(22, 18, 14, 0.62); cursor: pointer; overflow: hidden;
+  animation: fade 0.35s ease both; transition: opacity 0.35s ease;
+}
+.victory.leaving { opacity: 0; }
+.victory::before {
+  /* 勝った側の色の集中線をゆっくり回す */
+  content: ""; position: absolute; left: 50%; top: 50%; width: 200vmax; height: 200vmax; margin: -100vmax 0 0 -100vmax;
+  background: repeating-conic-gradient(from 0deg, rgba(255, 196, 160, 0.13) 0deg 6deg, transparent 6deg 15deg);
+  mask-image: radial-gradient(circle, #000 0 16vmax, transparent 52vmax);
+  animation: sunburst 30s linear infinite;
+}
+.victory.p1::before { background: repeating-conic-gradient(from 0deg, rgba(170, 205, 245, 0.14) 0deg 6deg, transparent 6deg 15deg); }
+.victory-stage { position: relative; text-align: center; }
+.victory-word {
+  margin: 0; font-family: var(--display); font-weight: 800; font-size: clamp(54px, 9vw, 112px);
+  letter-spacing: 0.06em; line-height: 1; color: var(--gold);
+  text-shadow: 0 4px 0 #8A5A10, 0 12px 34px rgba(0, 0, 0, 0.4);
+  animation: victory-word 0.7s cubic-bezier(.3,1.6,.5,1) 0.1s both;
+}
+/* 体の中心が真ん中に来るよう、剣の側へずらす */
+.victory-hero { position: relative; width: clamp(220px, 26vw, 300px); margin: clamp(96px, 15vh, 132px) auto 0; translate: 19% 0; }
+.victory.p1 .victory-hero { translate: -19% 0; }
+.victory-hero .figure { width: 100%; transform-origin: 30.5% 100%; animation: victory-jump 0.9s ease-in-out 0.3s infinite; }
+.victory.p1 .victory-hero .figure { transform-origin: 69.5% 100%; }
+.victory-hero .figure::after { display: none; }
+.victory-hero .figure .mascot-inner { animation: none; }
+.victory-hero .foil { transform-box: view-box; transform-origin: 30.6px 9px; animation: foil-raise 0.9s ease-in-out 0.3s infinite; }
+.victory-shadow {
+  position: absolute; left: 7%; bottom: -10px; width: 47%; height: 14px; border-radius: 50%;
+  background: rgba(0, 0, 0, 0.38); animation: victory-shadow 0.9s ease-in-out 0.3s infinite;
+}
+.victory.p1 .victory-shadow { left: auto; right: 7%; }
+.victory-name { margin: 26px 0 0; animation: rise 0.5s ease 0.5s both; }
+.victory-name .result-pill { font-size: clamp(26px, 3.4vw, 36px); padding: 4px 30px; }
+.victory-score {
+  margin: 14px 0 0; display: flex; gap: 18px; justify-content: center; align-items: center;
+  font-family: var(--display); font-weight: 800; font-size: clamp(34px, 4vw, 48px); color: #fff;
+  animation: rise 0.5s ease 0.7s both;
+}
+.victory-score .p0 { color: #F4A585; }
+.victory-score .p1 { color: #9CC3EC; }
+.victory-score i { font-style: normal; opacity: 0.55; }
 
 /* 画面の揺れ */
 .shake { animation: shake 0.45s ease both; }
@@ -639,6 +698,33 @@ button.card.selected:hover { transform: rotate(var(--tilt, 0deg)) translateY(-14
 @keyframes shake {
   0%, 100% { transform: none; } 15% { transform: translate(-5px, 2px); } 30% { transform: translate(5px, -2px); }
   45% { transform: translate(-4px, 1px); } 60% { transform: translate(3px, -1px); } 80% { transform: translate(-1px, 0); }
+}
+@keyframes flutter { from { transform: rotate3d(1, 0.35, 0, 0deg); } to { transform: rotate3d(1, 0.35, 0, 360deg); } }
+@keyframes cannon { from { opacity: 1; scale: 0.2; } to { opacity: 0; scale: 1.7; } }
+@keyframes sunburst { to { rotate: 360deg; } }
+@keyframes victory-word {
+  0% { opacity: 0; transform: scale(0.3) rotate(-10deg); }
+  60% { opacity: 1; transform: scale(1.12) rotate(-4deg); }
+  100% { opacity: 1; transform: scale(1) rotate(-4deg); }
+}
+/* しゃがむ → 跳ぶ → 着地でつぶれる */
+@keyframes victory-jump {
+  0%, 100% { transform: translateY(0) scale(1, 1); }
+  12% { transform: translateY(0) scale(1.12, 0.86); }
+  30% { transform: translateY(-58%) scale(0.94, 1.08); }
+  48% { transform: translateY(-72%) scale(1, 1); }
+  68% { transform: translateY(-36%) scale(0.97, 1.04); }
+  82% { transform: translateY(0) scale(1.14, 0.84); }
+  92% { transform: translateY(0) scale(0.97, 1.03); }
+}
+@keyframes victory-shadow {
+  0%, 12%, 82%, 100% { transform: scale(1); opacity: 1; }
+  48% { transform: scale(0.5); opacity: 0.45; }
+}
+/* 跳んでいる間、剣を高く掲げる */
+@keyframes foil-raise {
+  0%, 10%, 86%, 100% { transform: rotate(0deg); }
+  36%, 62% { transform: rotate(-40deg); }
 }
 @keyframes card-out { to { opacity: 0; transform: translateY(-30px) scale(0.85); } }
 @keyframes card-in { from { opacity: 0; transform: translateY(18px) scale(0.9); } }

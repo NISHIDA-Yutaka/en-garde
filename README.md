@@ -12,4 +12,6 @@ pnpm test              # ルールとサーバーのテスト
 PORT=8090 pnpm start   # http://127.0.0.1:8090
 ```
 
+試合の勝利演出は `/?demo=victory`（勝った側の画面）と `/?demo=defeat`（負けた側）で、対戦せずにすぐ見られる。
+
 本番は `deploy-app en-garde`（main に push すると自動デプロイ）。部屋はメモリだけに持つので、デプロイすると対戦中の部屋は消える。

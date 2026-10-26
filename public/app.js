@@ -32,6 +32,7 @@ const app = {
   queue: Promise.resolve(),
   modalKey: null,
   inviteRoom: new URLSearchParams(location.search).get('room')?.toUpperCase() || null,
+  demo: null, // 演出の確認用ページのとき 'victory' / 'defeat'（サーバーにはつながない）
 };
 
 // ------------------------------------------------------------------ 保存
@@ -525,7 +526,9 @@ function renderPresence() {
     box.hidden = true;
     return;
   }
-  if (!app.connected && !app.superseded) {
+  if (app.demo) {
+    box.hidden = true;
+  } else if (!app.connected && !app.superseded) {
     box.textContent = '接続が切れました。つなぎ直しています…';
     box.hidden = false;
   } else if (app.seat !== null && app.view && !app.peers[1 - app.seat]) {
@@ -739,14 +742,14 @@ async function playEvents(prev, v) {
         if (ev.winner !== null) {
           setFace(fencers[ev.winner], 'happy');
           if (ev.reason === 'deck') setFace(fencers[1 - ev.winner], 'sad');
-          confetti(ev.winner, 40);
+          if (nextEv?.type !== 'matchEnd') confetti(ev.winner, 40); // 試合が決まったときは勝利演出で打ち上げる
         }
         await sleep(ev.reason === 'deck' ? 700 : 500);
         break;
       }
       case 'matchEnd':
-        confetti(ev.winner, 120);
-        await sleep(400);
+        await sleep(500);
+        await celebrate(ev.winner, v.scores);
         break;
       default:
     }
@@ -773,6 +776,94 @@ function confetti(winner, n) {
   }
   document.body.append(layer);
   setTimeout(() => layer.remove(), 4200);
+}
+
+// 試合の勝利演出。画面を暗くし、勝った側の剣士が笑顔で跳ね、下の両はしから紙吹雪を打ち上げる。
+// 押すと早めに終わる
+function celebrate(winner, scores) {
+  return new Promise((resolve) => {
+    const layer = document.createElement('div');
+    layer.className = `victory p${winner}`;
+    const who = winner === app.seat ? 'あなた' : escapeHtml(nameOf(winner));
+    layer.innerHTML = `<div class="victory-stage">
+        <p class="victory-word">VICTOIRE!</p>
+        <div class="victory-hero"><span class="victory-shadow"></span></div>
+        <p class="victory-name"><span class="result-pill p${winner}">${who}の勝利！</span></p>
+        <p class="victory-score"><span class="p0">${scores[0]}</span><i>–</i><span class="p1">${scores[1]}</span></p>
+      </div>`;
+    layer.querySelector('.victory-hero').prepend(createFigure(winner, 'happy'));
+    document.body.append(layer);
+
+    const timers = [];
+    if (!reduceMotion) {
+      timers.push(setTimeout(() => confettiCannons(winner), 250));
+      timers.push(setTimeout(() => confettiCannons(winner), 1150));
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      timers.forEach(clearTimeout);
+      layer.classList.add('leaving');
+      setTimeout(() => layer.remove(), reduceMotion ? 0 : 350);
+      resolve();
+    };
+    timers.push(setTimeout(finish, reduceMotion ? 1500 : 4600));
+    layer.addEventListener('click', finish);
+  });
+}
+
+// 画面の下の左右から、紙吹雪を斜め上へ打ち上げる。頂上で止まり、ひらひら落ちる
+function confettiCannons(winner) {
+  const colors = winner === 0
+    ? ['#D9714E', '#F2B53A', '#E8906F', '#4F9A6A', '#5B93D0', '#FFFFFF']
+    : ['#5B93D0', '#F2B53A', '#8DB6E2', '#4F9A6A', '#D9714E', '#FFFFFF'];
+  const W = window.innerWidth;
+  const H = window.innerHeight;
+  const layer = document.createElement('div');
+  layer.className = 'confetti';
+  for (const [x0, lean] of [[W * 0.04, 1], [W * 0.96, -1]]) {
+    const flash = document.createElement('b');
+    flash.className = 'cannon-flash';
+    flash.style.left = `${x0}px`;
+    flash.style.setProperty('--lean', `${lean * 24}deg`);
+    layer.append(flash);
+    for (let i = 0; i < 80; i += 1) {
+      const angle = (lean * (12 + Math.random() * 30) * Math.PI) / 180; // 真上から内側へ傾ける
+      const rise = H * (0.5 + Math.random() * 0.45);
+      const x1 = x0 + Math.tan(angle) * rise;
+      const y1 = -rise;
+      const up = 520 + Math.random() * 380;
+      const fallMs = 2200 + Math.random() * 1600;
+      const sway = 18 + Math.random() * 36;
+      const drift = (Math.random() - 0.5) * 120;
+      const piece = document.createElement('span');
+      piece.className = 'piece';
+      const paper = document.createElement('i');
+      const kind = i % 4;
+      if (kind === 0) paper.style.borderRadius = '50%';
+      if (kind === 1) { paper.style.width = '5px'; paper.style.height = '18px'; }
+      paper.style.background = colors[i % colors.length];
+      paper.style.setProperty('--flip', `${0.5 + Math.random() * 0.7}s`);
+      piece.append(paper);
+      piece.style.left = `${x0}px`;
+      layer.append(piece);
+      const spin = (Math.random() - 0.5) * 1440;
+      const at = (t, dx, dy, r) => ({ offset: t, transform: `translate(${dx}px, ${dy}px) rotate(${r}deg)` });
+      const total = up + fallMs;
+      const tUp = up / total;
+      const frames = [{ ...at(0, 0, 0, 0), easing: 'cubic-bezier(.1,.75,.3,1)' }, at(tUp, x1 - x0, y1, spin * 0.4)];
+      // 落ちるときは左右に揺れる
+      for (let k = 1; k <= 4; k += 1) {
+        const t = tUp + ((1 - tUp) * k) / 4;
+        frames.push(at(t, x1 - x0 + drift * (k / 4) + (k % 2 ? sway : -sway), y1 + (rise + 60) * (k / 4), spin * (0.4 + 0.15 * k)));
+      }
+      frames.forEach((f, k) => { if (k > 0) f.easing = k === 1 ? 'ease-in' : 'ease-in-out'; });
+      piece.animate(frames, { duration: total, delay: Math.random() * 90, fill: 'both' });
+    }
+  }
+  document.body.append(layer);
+  setTimeout(() => layer.remove(), 4300);
 }
 
 function roundIntro(v) {
@@ -932,6 +1023,10 @@ function showMatchModal(v) {
     id: 'next-btn',
     label: 'もう一度対戦',
     onClick: () => {
+      if (app.demo) {
+        playDemo();
+        return;
+      }
       send({ t: 'rematch' });
       app.ready[app.seat] = true;
       renderModalButtons();
@@ -949,7 +1044,7 @@ function renderModalButtons() {
   const theirs = app.ready[1 - app.seat];
   const rematch = app.view.phase === 'matchOver';
   btn.disabled = mine;
-  btn.textContent = mine ? '相手を待っています…' : rematch ? 'もう一度対戦' : '次のラウンドへ';
+  btn.textContent = mine ? '相手を待っています…' : rematch ? (app.demo ? 'もう一度見る' : 'もう一度対戦') : '次のラウンドへ';
   note.textContent = theirs && !mine ? `${nameOf(1 - app.seat)}は準備できています` : '';
 }
 
@@ -1067,11 +1162,78 @@ function wire() {
   window.addEventListener('resize', () => { if (app.view && !app.animating) placeFencers(app.view.positions); });
 }
 
+// ------------------------------------------------------------------ 演出の確認用ページ
+// /?demo=victory は自分が勝つ側、/?demo=defeat は負ける側の画面。最後の一撃から勝利演出・結果までを流す
+
+function demoViews() {
+  const winner = app.demo === 'defeat' ? 1 : 0;
+  const before = {
+    you: 0, round: 8, startPlayer: 1, scores: winner === 0 ? [4, 3] : [3, 4], positions: [9, 13],
+    turn: winner, phase: 'action', winner: null, myHand: [1, 2, 4, 4, 5], opponentHandCount: 5,
+    deckCount: 4, discardTop: 2, parried: null, roundResult: null, lastEvents: [], legal: [],
+  };
+  const after = {
+    ...before,
+    scores: winner === 0 ? [5, 3] : [3, 5],
+    phase: 'matchOver',
+    winner,
+    myHand: winner === 0 ? [1, 2, 3, 5, 5] : [1, 2, 4, 4, 5],
+    opponentHandCount: winner === 0 ? 5 : 3,
+    roundResult: { winner, reason: 'hit' },
+    lastEvents: [
+      { type: 'attack', player: winner, value: 4, count: 2 },
+      { type: 'hit', player: winner },
+      { type: 'roundEnd', winner, reason: 'hit' },
+      { type: 'matchEnd', winner },
+    ],
+  };
+  return [before, after];
+}
+
+async function playDemo() {
+  if (app.animating) return;
+  closeModal();
+  const [before, after] = demoViews();
+  app.view = before;
+  app.seq = 0;
+  app.ready = [false, false];
+  clearLog();
+  logSeparator(`第${before.round}ラウンド ・ 先手 ${nameOf(before.startPlayer)}`);
+  render();
+  await sleep(1000);
+  logEvents(after.lastEvents);
+  app.animating = true;
+  render();
+  try {
+    await playEvents(before, after);
+  } finally {
+    app.animating = false;
+  }
+  app.view = after;
+  app.seq = 1;
+  render({ scoresFrom: before.scores });
+  showMatchModal(after);
+}
+
+function startDemo(kind) {
+  app.demo = kind;
+  app.seat = 0;
+  app.names = ['アリス', 'ボブ'];
+  showScreen('game');
+  toast('演出の確認用の画面です（対戦にはつながっていません）');
+  playDemo();
+}
+
 // ------------------------------------------------------------------ 起動
 
 function init() {
   buildPiste();
   wire();
+  const demo = new URLSearchParams(location.search).get('demo');
+  if (demo === 'victory' || demo === 'defeat') {
+    startDemo(demo);
+    return;
+  }
   const saved = store.seat;
   // 招待URLで別の部屋を開いたときは、前の席には戻らない
   if (saved && (!app.inviteRoom || app.inviteRoom === saved.room)) {
